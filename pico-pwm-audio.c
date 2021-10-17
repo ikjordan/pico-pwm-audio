@@ -12,9 +12,23 @@
  * if you want to know how to make these please see the python code
  * for converting audio samples into static arrays. 
  */
-#include "sample.h"
+//#include "preamble.h"
+#include "panther.h"
+//#include "ring.h"
+//#include "sample.h"
 //#include "thats_cool.h"
 int wav_position = 0;
+
+#ifndef SAMPLE_RATE
+#define SAMPLE_RATE 11000
+#endif
+
+#ifdef TWELVE_BIT
+int shift = 0;
+#else
+int shift = 3;
+#endif
+int repeat_shift = 1;
 
 /*
  * PWM Interrupt Handler which outputs PWM level and advances the 
@@ -29,7 +43,7 @@ void pwm_interrupt_handler() {
     pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));    
 
     // Update the position within the buffer
-    if (wav_position < (WAV_DATA_LENGTH<<3) - 1) 
+    if (wav_position < (WAV_DATA_LENGTH<<repeat_shift) - 1) 
     { 
         wav_position++;
     } else 
@@ -37,9 +51,9 @@ void pwm_interrupt_handler() {
         // reset to start
         wav_position = 0;
     }
-    pwm_set_gpio_level(AUDIO_PIN, WAV_DATA[wav_position>>3]); 
+    pwm_set_gpio_level(AUDIO_PIN, WAV_DATA[wav_position>>repeat_shift] << shift); 
 #ifdef STEREO    
-    pwm_set_gpio_level(AUDIO_PIN + 1, WAV_DATA[wav_position>>3]); 
+    pwm_set_gpio_level(AUDIO_PIN + 1, WAV_DATA[wav_position>>repeat_shift] << shift); 
 #endif
 }
 
@@ -78,27 +92,43 @@ int main(void) {
 
     // Setup PWM for audio output
     pwm_config config = pwm_get_default_config();
-    /* Base clock 176,000,000 Hz divide by wrap 250 then the clock divider further divides
-     * to set the interrupt rate. 
+    /* Base clock 176,000,000 Hz 
+       Want 12 bit samples at 44kHz - 4000 * 44kHz gives 176,000,000
      * 
-     * 11 KHz is fine for speech. Phone lines generally sample at 8 KHz
-     * 
-     * 
-     * So clkdiv should be as follows for given sample rate
-     *  8.0f for 11 KHz
-     *  4.0f for 22 KHz
-     *  2.0f for 44 KHz etc
+     * For lower sample rates - repeat the sample
+     *  4 repeats for 11 KHz
+     *  2 repeats for 22 KHz
      */
-    // Clock rate is 176 MHz
-    // In theory have a range of 2^16, but in reality it is limited to wrap
-    // If we limit wrap to 250, then the duty cycle has to be in range 0 to 249 - larger values will be clipped
+    // Note we can only support range 0-3999, rather than full 12 bit range, this is due to 
+    // issues setting the pico clock to exactly the right speed
 
-    // Reduces the effective clock to 176 / 8 = 22 MHz
-    pwm_config_set_clkdiv(&config, 8.0f); 
+    // We want to use the full clock range - so set the divider to 1
+    pwm_config_set_clkdiv(&config, 1.0f); 
 
-    // 250 samples at 22 MHz is 88 KHz
-    // For 11 kHz we then repeat the sample 8 times in the isr - to give 11 kHz
-    pwm_config_set_wrap(&config, 250); 
+    // Set the wrap to 4000, giving us our (slightly reduced) 12 bits at 44 kHz
+    // For CD quality it should really be 44.1 kHz...
+    pwm_config_set_wrap(&config, 4000); 
+
+    // Determine the repeat rate
+    switch (SAMPLE_RATE)
+    {
+        case 11000:
+            repeat_shift = 2;
+        break;
+
+        case 22000:
+            repeat_shift = 1;
+        break;
+
+        case 44000:
+            repeat_shift = 0;
+        break;
+
+        default:
+            // Not a supported rate
+            return -1;
+        break;
+    }
 
     // Set the initial value of the pwm before start
     pwm_set_chan_level(pwm_gpio_to_slice_num(AUDIO_PIN), pwm_gpio_to_channel(AUDIO_PIN), WAV_DATA[0]);
