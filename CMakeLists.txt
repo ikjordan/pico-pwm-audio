@@ -23,7 +23,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(pico-pwm-audio pico-pwm-audio.c )
+add_executable(pico-pwm-audio pico-pwm-audio.c pwm_channel.c)
 
 pico_set_program_name(pico-pwm-audio "pico-pwm-audio")
 pico_set_program_version(pico-pwm-audio "0.1")

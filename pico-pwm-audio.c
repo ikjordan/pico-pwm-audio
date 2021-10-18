@@ -1,9 +1,10 @@
 #include <stdio.h>
 #include "pico/stdlib.h"   // stdlib 
 #include "hardware/irq.h"  // interrupts
-#include "hardware/pwm.h"  // pwm 
+//#include "hardware/pwm.h"  // pwm 
 #include "hardware/dma.h"  // dma 
 #include "hardware/sync.h" // wait for interrupt 
+#include "pwm_channel.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
@@ -28,7 +29,7 @@
 #ifndef SAMPLE_RATE
 #define SAMPLE_RATE 11000
 #endif
-#define DMA_BUFFER_LENGTH 550      // 550 samples = 0.05 seconds at 11 KHz, so volume will change on avaerge in 0.15 seconds
+#define DMA_BUFFER_LENGTH 2200      // 2200 samples @ 44kHz gives= 0.05 seconds = interrupt rate
 /*
  * Static variable definitions
  */
@@ -43,10 +44,11 @@ static const int shift = 3;
 
 static int repeat_shift = 1;                // Defined by the sample rate
 static int wav_position[CHANNELS>>1];       // Holds position for left and right channels
-static int audio_pin_slice[CHANNELS>>1];    // PWM slide for left and right channels
+
+static pwm_data pwm_channel[CHANNELS>>1];   // Represents the PWM channels
 
  // Have 2 or 4 1.1 kBytes buffers in RAM that are used to DMA the samples to the PWM engine
-static volatile uint16_t buffer[CHANNELS][DMA_BUFFER_LENGTH];
+static uint16_t buffer[CHANNELS][DMA_BUFFER_LENGTH];
 static int dma_channel[CHANNELS];
 
 static float volume = 0.1;                  // Volume adjust, will be controlled by button
@@ -54,10 +56,11 @@ static float volume = 0.1;                  // Volume adjust, will be controlled
 /* 
  * Function declarations
  */
-static void populate_dma_buffer(int buffer_index);
-static void claim_dma_channels(int num_channels);
-static void initialise_dma(int buffer_index, int slice, int chain_index);
-static void dma_interrupt_handler();
+static void populateDmaBuffer(int buffer_index);
+static void claimDmaChannels(int num_channels);
+static void initDma(int buffer_index, int slice, int chain_index);
+static void dmaInterruptHandler();
+int getRepeatShift(uint sample_rate);
 
 /* 
  * Function definitions
@@ -65,7 +68,7 @@ static void dma_interrupt_handler();
 
 // Handles interrupts for the left channel (only one linked to IRQ)
 // Loads next buffer, and ressts start address for DMA
-static void dma_interrupt_handler() 
+static void dmaInterruptHandler() 
 {
     // Determine which DMA caused the interrupt
     for (int i = 0 ; i<2; ++i)
@@ -73,12 +76,12 @@ static void dma_interrupt_handler()
         if (dma_channel_get_irq0_status(dma_channel[i]))
         {
             dma_channel_acknowledge_irq0(dma_channel[i]);
-            populate_dma_buffer(i);
+            populateDmaBuffer(i);
             dma_channel_set_read_addr(dma_channel[i], buffer[i], false);
 
             if (CHANNELS > 2)
             {
-                populate_dma_buffer(i+2);
+                populateDmaBuffer(i+2);
                 dma_channel_set_read_addr(dma_channel[i+2], buffer[i+2], false);
             }
         }
@@ -86,10 +89,13 @@ static void dma_interrupt_handler()
 }
 
 // Populate the DMA buffer, referenced by index
-static void populate_dma_buffer(int buffer_index)
+static void populateDmaBuffer(int buffer_index)
 {
     for (int i=0; i<DMA_BUFFER_LENGTH; ++i)
     {
+        // Write to buffer, adjusting for volume
+        buffer[buffer_index][i] = (((WAV_DATA[wav_position[buffer_index>>1]>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
+
         if (wav_position[buffer_index>>1] < (WAV_DATA_LENGTH<<repeat_shift) - 1) 
         { 
             wav_position[buffer_index>>1]++;
@@ -98,13 +104,11 @@ static void populate_dma_buffer(int buffer_index)
             // reset to start
             wav_position[buffer_index>>1] = 0;
         }
-        // Write to buffer, adjusting for volume
-        buffer[buffer_index][i] = (((WAV_DATA[wav_position[buffer_index>>1]>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
     }
 }
 
 // Obtain the DMA channels - need 2 per channel (i.e. 4 for stereo)
-static void claim_dma_channels(int num_channels)
+static void claimDmaChannels(int num_channels)
 {
     for (int i=0; i<num_channels; ++i)
     {
@@ -113,7 +117,7 @@ static void claim_dma_channels(int num_channels)
 }
 
 // Configure the DMA channels - including chaining
-static void initialise_dma(int buffer_index, int slice, int chain_index)
+static void initDma(int buffer_index, int slice, int chain_index)
 {
     dma_channel_config config = dma_channel_get_default_config(dma_channel[buffer_index]); 
     channel_config_set_read_increment(&config, true); 
@@ -131,6 +135,34 @@ static void initialise_dma(int buffer_index, int slice, int chain_index)
                           false);
 }
 
+// Determine how often a value needs to be repeated, based on the sampling rate
+// If repeat is 2^m return m
+int getRepeatShift(uint sample_rate)
+{
+    int ret;
+    // Determine the repeat rate
+    switch (sample_rate)
+    {
+        case 11000:
+            ret = 2;
+        break;
+
+        case 22000:
+            ret = 1;
+        break;
+
+        case 44000:
+            ret = 0;
+        break;
+
+        default:
+            // Not a supported rate
+            ret = -1;
+        break;
+    }
+    return ret;
+}
+
 int main(void) 
 {
     /* Overclocking for fun but then also so the system clock is a 
@@ -141,70 +173,34 @@ int main(void)
     // Overclock to 176MHz - assert if cannot be set
     set_sys_clock_khz(176000, true);   
 
+    // Initialise the repeat shift, based on sampling rate
+    repeat_shift = getRepeatShift(SAMPLE_RATE);
+
+    // Set up the PWMs - A single pwm period will be 176 MHz / WRAP = 44 kHz
     for (int i=0; i<(CHANNELS>>1); ++i)
     {
-        // Set the audio pin to PWM
-        gpio_set_function(AUDIO_PIN+i, GPIO_FUNC_PWM); 
-        // Get which of the 8 pwm slices has been assigned to the PWM
-        audio_pin_slice[i] = pwm_gpio_to_slice_num(AUDIO_PIN+i);
-    }
+        pwmChannelInit(&pwm_channel[i], AUDIO_PIN+i, 1.0f, WRAP);
 
-    // Setup PWM for audio output
-    pwm_config config = pwm_get_default_config();
-    /* Base clock 176,000,000 Hz 
-       Want 12 bit samples at 44kHz - 4000 * 44kHz gives 176,000,000
-     * 
-     * For lower sample rates - repeat the sample
-     *  4 repeats for 11 KHz
-     *  2 repeats for 22 KHz
-     */
-    // Note we can only support range 0-3999, rather than full 12 bit range, this is due to 
-    // issues setting the pico clock to exactly the right speed
-
-    // We want to use the full clock range - so set the divider to 1
-    pwm_config_set_clkdiv(&config, 1.0f); 
-
-    // Set the wrap to 4000, giving us our (slightly reduced) 12 bits at 44 kHz
-    // For CD quality it should really be 44.1 kHz...
-    pwm_config_set_wrap(&config, WRAP); 
-
-    // Determine the repeat rate
-    switch (SAMPLE_RATE)
-    {
-        case 11000:
-            repeat_shift = 2;
-        break;
-
-        case 22000:
-            repeat_shift = 1;
-        break;
-
-        case 44000:
-            repeat_shift = 0;
-        break;
-
-        default:
-            // Not a supported rate
-            return -1;
-        break;
+        // Set the initial value of the pwm before start
+        pwmChannelSetFirstValue(&pwm_channel[i], MID_POINT);
     }
 
     // Initialise the DMA(s)
-    claim_dma_channels(CHANNELS);
+    claimDmaChannels(CHANNELS);
 
     for (int i=0; i<CHANNELS; i+=2)
     {
-        initialise_dma(i, audio_pin_slice[i>>1], i+1);
-        initialise_dma(i+1, audio_pin_slice[i>>1], i);
+        initDma(i, pwmChannelGetSlice(&pwm_channel[i>>1]), i+1);
+        initDma(i+1, pwmChannelGetSlice(&pwm_channel[i>>1]), i);
     }
     // Populate the buffers
     for (int i=0; i<CHANNELS; ++i)
     {
-        populate_dma_buffer(i);
+        populateDmaBuffer(i);
     }
 
     // Set the DMA interrupt handler
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_interrupt_handler); 
+    irq_set_exclusive_handler(DMA_IRQ_0, dmaInterruptHandler); 
 
     // Enable the interrupts, only handle interrupts on left channel
     int mask = 0;
@@ -218,22 +214,44 @@ int main(void)
     irq_set_enabled(DMA_IRQ_0, true);
 
     // Trigger the DMA(s)
+    uint32_t chan_mask = 0;
+    
     for (int i=0; i<CHANNELS; i+=2)
     {
-        dma_channel_start(dma_channel[i]);
+        chan_mask |= 0x01 << dma_channel[i];
     }
 
-    // Complete configuration of the PWMs and start them
+    // Start the PWMs
+    uint32_t pwm_mask = 0;
     for (int i=0; i<(CHANNELS>>1); ++i)
     {
-        // Set the initial value of the pwm before start
-        pwm_set_chan_level(audio_pin_slice[i], pwm_gpio_to_channel(AUDIO_PIN+i), WAV_DATA[0]);
-        pwm_init(audio_pin_slice[i], &config, true);
+        // Build the start mask
+        pwmChannelAddStartList(&pwm_channel[i], &pwm_mask);
     }
+    
+    dma_start_channel_mask(chan_mask);
+    pwmChannelStartList(pwm_mask);
 
     // Main loop - would generate noise, handle buttons for volume, parse wav blocks etc here 
+    // set one shot timer to stop after 40 seconds
+    //add_alarm_in_ms(4000, alarm_callback, NULL, false);
+
+    sleep_ms(4000);
+
+    for (int i=0; i<(CHANNELS>>1); ++i)
+    {
+        pwmChannelStop(&pwm_channel[i]);
+    }
+
+    for (int i=0; i<CHANNELS; ++i)
+    {
+        dma_channel_abort(dma_channel[i]);
+    }
+    return 0;
+
     while(1) 
     {
         __wfi(); // Wait for Interrupt
     }
 }
+
