@@ -7,6 +7,7 @@
 #include "pico/util/queue.h" 
 
 #include "pwm_channel.h"
+#include "debounce_button.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
@@ -65,6 +66,7 @@ enum Event
     quit = 3, 
 }; 
 
+static debounce_button_data button[4];
 /* 
  * Function declarations
  */
@@ -75,8 +77,8 @@ static void dmaInterruptHandler();
 int getRepeatShift(uint sample_rate);
 
 void stopMusic();
-int64_t alarm_callback(alarm_id_t id, void *user_data);
-bool repeating_timer_callback(struct repeating_timer *t);
+void buttonCallback(uint gpio_number, enum debounce_event event);
+
 /* 
  * Function definitions
  */
@@ -245,6 +247,12 @@ int main(void)
         pwmChannelAddStartList(&pwm_channel[i], &pwm_mask);
     }
     
+    // Initialise the buttons
+    debounceButtonCreate(&button[0], 20, 40, buttonCallback, true, false);
+    debounceButtonCreate(&button[1], 21, 40, buttonCallback, true, false);
+    debounceButtonCreate(&button[2], 22, 40, buttonCallback, true, false);
+    debounceButtonCreate(&button[3], 14, 40, buttonCallback, false, true);
+
     dma_start_channel_mask(chan_mask);
     pwmChannelStartList(pwm_mask);
 
@@ -255,13 +263,6 @@ int main(void)
 
     // Create event queue 
     queue_init(&eventQueue, sizeof(event), 4);
-
-    // Set the alarm to increase volume
-    repeating_timer_t repeat;
-    add_repeating_timer_ms(4000, repeating_timer_callback, NULL, &repeat);
-
-    // Set the alarm to stop
-    add_alarm_in_ms(41000, alarm_callback, NULL, true);
 
     // Process events
     bool cont = true;
@@ -288,25 +289,34 @@ int main(void)
             break;
         }
     }
-    cancel_repeating_timer(&repeat);
     stopMusic();
 
     return 0;
 }
 
-bool repeating_timer_callback(struct repeating_timer *t) 
+void buttonCallback(uint gpio_number, enum debounce_event event)
 {
-    enum Event e = increase;
-    
-    queue_try_add(&eventQueue, &e);
-    return true;
-}
+    enum Event e = empty;
 
-int64_t alarm_callback(alarm_id_t id, void *user_data) 
-{
-    enum Event e = quit;
+    switch (gpio_number)
+    {
+        case 14:
+            e = increase;
+        break;
+
+        case 20:
+            e = increase;
+        break;
+
+        case 21:
+            e = decrease;
+        break;
+
+        case 22:
+            e = quit;
+        break;
+    }
     queue_try_add(&eventQueue, &e);
-    return 0;
 }
 
 void stopMusic()
