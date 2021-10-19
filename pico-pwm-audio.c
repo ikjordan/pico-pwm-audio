@@ -1,9 +1,11 @@
 #include <stdio.h>
+#include <math.h>          // For fminf and fmaxf
 #include "pico/stdlib.h"   // stdlib 
 #include "hardware/irq.h"  // interrupts
-//#include "hardware/pwm.h"  // pwm 
 #include "hardware/dma.h"  // dma 
 #include "hardware/sync.h" // wait for interrupt 
+#include "pico/util/queue.h" 
+
 #include "pwm_channel.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
@@ -53,6 +55,16 @@ static int dma_channel[CHANNELS];
 
 static float volume = 0.1;                  // Volume adjust, will be controlled by button
 
+queue_t eventQueue;
+
+enum Event 
+{
+    empty = 0,
+    increase = 1, 
+    decrease = 2, 
+    quit = 3, 
+}; 
+
 /* 
  * Function declarations
  */
@@ -62,6 +74,9 @@ static void initDma(int buffer_index, int slice, int chain_index);
 static void dmaInterruptHandler();
 int getRepeatShift(uint sample_rate);
 
+void stopMusic();
+int64_t alarm_callback(alarm_id_t id, void *user_data);
+bool repeating_timer_callback(struct repeating_timer *t);
 /* 
  * Function definitions
  */
@@ -183,6 +198,7 @@ int main(void)
 
         // Set the initial value of the pwm before start
         pwmChannelSetFirstValue(&pwm_channel[i], MID_POINT);
+
     }
 
     // Initialise the DMA(s)
@@ -235,9 +251,67 @@ int main(void)
     // Main loop - would generate noise, handle buttons for volume, parse wav blocks etc here 
     // set one shot timer to stop after 40 seconds
     //add_alarm_in_ms(4000, alarm_callback, NULL, false);
+    enum Event event = empty;
 
-    sleep_ms(4000);
+    // Create event queue 
+    queue_init(&eventQueue, sizeof(event), 4);
 
+    // Set the alarm to increase volume
+    repeating_timer_t repeat;
+    add_repeating_timer_ms(4000, repeating_timer_callback, NULL, &repeat);
+
+    // Set the alarm to stop
+    add_alarm_in_ms(41000, alarm_callback, NULL, true);
+
+    // Process events
+    bool cont = true;
+    while (cont)
+    {
+        queue_remove_blocking(&eventQueue, &event);
+        
+        switch (event)
+        {
+            case increase:
+                volume = fminf(1.0, volume+0.1);
+            break;
+
+            case decrease:
+                volume = fmaxf(0.0, volume-0.1);
+            break;
+
+            case quit:
+                cont = false;
+            break;
+
+            default:
+                return -1;
+            break;
+        }
+    }
+    cancel_repeating_timer(&repeat);
+    stopMusic();
+
+    return 0;
+}
+
+bool repeating_timer_callback(struct repeating_timer *t) 
+{
+    enum Event e = increase;
+    
+    queue_try_add(&eventQueue, &e);
+    return true;
+}
+
+int64_t alarm_callback(alarm_id_t id, void *user_data) 
+{
+    enum Event e = quit;
+    queue_try_add(&eventQueue, &e);
+    return 0;
+}
+
+void stopMusic()
+{
+        
     for (int i=0; i<(CHANNELS>>1); ++i)
     {
         pwmChannelStop(&pwm_channel[i]);
@@ -246,12 +320,6 @@ int main(void)
     for (int i=0; i<CHANNELS; ++i)
     {
         dma_channel_abort(dma_channel[i]);
-    }
-    return 0;
-
-    while(1) 
-    {
-        __wfi(); // Wait for Interrupt
     }
 }
 
