@@ -2,7 +2,7 @@
 #include "pico/stdlib.h"   // stdlib 
 #include "hardware/pwm.h"  // pwm 
 
-typedef struct {
+typedef struct pwm_data {
     int pin_slice;
     uint gpio_number;
 } pwm_data;

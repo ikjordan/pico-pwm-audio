@@ -8,6 +8,7 @@
 
 #include "pwm_channel.h"
 #include "debounce_button.h"
+#include "sound_buffers.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
@@ -24,15 +25,17 @@
 //#include "thats_cool.h"
 
 #ifdef STEREO
-#define CHANNELS 4
-#else
 #define CHANNELS 2
+#else
+#define CHANNELS 1
 #endif
 
 #ifndef SAMPLE_RATE
 #define SAMPLE_RATE 11000
 #endif
 #define DMA_BUFFER_LENGTH 2200      // 2200 samples @ 44kHz gives= 0.05 seconds = interrupt rate
+
+#define RAM_BUFFER_LENGTH (2*DMA_BUFFER_LENGTH)
 /*
  * Static variable definitions
  */
@@ -46,15 +49,27 @@ static const int shift = 3;
 #define MID_POINT (WRAP>>1)                 // Equates to mid point in (reduced) 12 bit
 
 static int repeat_shift = 1;                // Defined by the sample rate
-static int wav_position[CHANNELS>>1];       // Holds position for left and right channels
+static int wav_position;                    // Holds position for left and right channels
 
-static pwm_data pwm_channel[CHANNELS>>1];   // Represents the PWM channels
+static pwm_data pwm_channel[CHANNELS];   // Represents the PWM channels
+static int dma_channel[2];
 
- // Have 2 or 4 1.1 kBytes buffers in RAM that are used to DMA the samples to the PWM engine
-static uint16_t buffer[CHANNELS][DMA_BUFFER_LENGTH];
-static int dma_channel[CHANNELS];
+ // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
+static uint32_t buffer[2][DMA_BUFFER_LENGTH];
 
-static float volume = 0.1;                  // Volume adjust, will be controlled by button
+// Have 2 or 4 8k buffers in RAM, copy data from Flash to these buffers - in future
+// will be buffers where noise is created, or music delivered from SD Card
+
+// RAM buffers - currently populated from Flash
+static uint16_t ram_buffer[CHANNELS*2][RAM_BUFFER_LENGTH];
+
+// Control data blocks for the RAM double buffers
+static sound_buffers double_buffers[CHANNELS];
+
+// Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
+static const uint16_t* current_RAM_Buffer[CHANNELS];
+
+static float volume = 0.4;                  // Volume adjust, will be controlled by button
 
 queue_t eventQueue;
 
@@ -62,8 +77,9 @@ enum Event
 {
     empty = 0,
     increase = 1, 
-    decrease = 2, 
-    quit = 3, 
+    decrease = 2,
+    fill_queue = 3, 
+    quit = 4, 
 }; 
 
 static debounce_button_data button[4];
@@ -83,7 +99,7 @@ void buttonCallback(uint gpio_number, enum debounce_event event);
  * Function definitions
  */
 
-// Handles interrupts for the left channel (only one linked to IRQ)
+// Handles interrupts for the DMA chain
 // Loads next buffer, and ressts start address for DMA
 static void dmaInterruptHandler() 
 {
@@ -95,12 +111,6 @@ static void dmaInterruptHandler()
             dma_channel_acknowledge_irq0(dma_channel[i]);
             populateDmaBuffer(i);
             dma_channel_set_read_addr(dma_channel[i], buffer[i], false);
-
-            if (CHANNELS > 2)
-            {
-                populateDmaBuffer(i+2);
-                dma_channel_set_read_addr(dma_channel[i+2], buffer[i+2], false);
-            }
         }
     }    
 }
@@ -108,23 +118,43 @@ static void dmaInterruptHandler()
 // Populate the DMA buffer, referenced by index
 static void populateDmaBuffer(int buffer_index)
 {
+    // Populate two bytes from each active buffer
     for (int i=0; i<DMA_BUFFER_LENGTH; ++i)
     {
         // Write to buffer, adjusting for volume
-        buffer[buffer_index][i] = (((WAV_DATA[wav_position[buffer_index>>1]>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
+        // build the 32 bit word from the two channels
+        uint32_t left = (((current_RAM_Buffer[0][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
+        uint32_t right = MID_POINT;
 
-        if (wav_position[buffer_index>>1] < (WAV_DATA_LENGTH<<repeat_shift) - 1) 
+        if (CHANNELS == 2)
+        {
+            right = (((current_RAM_Buffer[1][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
+        }
+
+        buffer[buffer_index][i] = (left << 16) + right;
+
+        if (wav_position < (RAM_BUFFER_LENGTH<<repeat_shift) - 1) 
         { 
-            wav_position[buffer_index>>1]++;
+            wav_position++;
         } else 
         {
+            // We need a new RAM buffer
+            current_RAM_Buffer[0] = soundBufferGetLast(&double_buffers[0]);
+            if (CHANNELS == 2)            
+            {
+                current_RAM_Buffer[1] = soundBufferGetLast(&double_buffers[1]);
+            }
             // reset to start
-            wav_position[buffer_index>>1] = 0;
+            wav_position = 0;
+
+            // Signal to populate a new RAM buffer
+            enum Event e = fill_queue;
+            queue_try_add(&eventQueue, &e);
         }
     }
 }
 
-// Obtain the DMA channels - need 2 per channel (i.e. 4 for stereo)
+// Obtain the DMA channels - need 2 
 static void claimDmaChannels(int num_channels)
 {
     for (int i=0; i<num_channels; ++i)
@@ -140,7 +170,7 @@ static void initDma(int buffer_index, int slice, int chain_index)
     channel_config_set_read_increment(&config, true); 
     channel_config_set_write_increment(&config, false); 
     channel_config_set_dreq(&config, DREQ_PWM_WRAP0 + slice); 
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_16); 
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32); 
     channel_config_set_chain_to(&config, dma_channel[chain_index]);
 
     // Set up config
@@ -189,80 +219,92 @@ int main(void)
 
     // Overclock to 176MHz - assert if cannot be set
     set_sys_clock_khz(176000, true);   
-
+    
     // Initialise the repeat shift, based on sampling rate
     repeat_shift = getRepeatShift(SAMPLE_RATE);
 
     // Set up the PWMs - A single pwm period will be 176 MHz / WRAP = 44 kHz
-    for (int i=0; i<(CHANNELS>>1); ++i)
+    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, 1.0f, WRAP);
+
+    // Set the initial value of the pwm before start
+    pwmChannelSetFirstValue(&pwm_channel[0], MID_POINT);
+
+    // Set up the right channel, if in stereo
+    if(CHANNELS == 2)
     {
-        pwmChannelInit(&pwm_channel[i], AUDIO_PIN+i, 1.0f, WRAP);
+        pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, 1.0f, WRAP);
 
         // Set the initial value of the pwm before start
-        pwmChannelSetFirstValue(&pwm_channel[i], MID_POINT);
-
+        pwmChannelSetFirstValue(&pwm_channel[1], MID_POINT);
     }
 
     // Initialise the DMA(s)
-    claimDmaChannels(CHANNELS);
+    claimDmaChannels(2);
 
-    for (int i=0; i<CHANNELS; i+=2)
-    {
-        initDma(i, pwmChannelGetSlice(&pwm_channel[i>>1]), i+1);
-        initDma(i+1, pwmChannelGetSlice(&pwm_channel[i>>1]), i);
-    }
-    // Populate the buffers
-    for (int i=0; i<CHANNELS; ++i)
-    {
-        populateDmaBuffer(i);
-    }
+    // Initialise and Chain the two DMAs together
+    initDma(0, pwmChannelGetSlice(&pwm_channel[0]), 1);
+    initDma(1, pwmChannelGetSlice(&pwm_channel[0]), 0);
 
     // Set the DMA interrupt handler
     irq_set_exclusive_handler(DMA_IRQ_0, dmaInterruptHandler); 
 
     // Enable the interrupts, only handle interrupts on left channel
     int mask = 0;
+
     for (int i=0;i<2;++i)
     {
         mask |= 0x01 << dma_channel[i];
     }
-    dma_set_irq0_channel_mask_enabled(mask, true);
 
-    // enable the interrupts
+    dma_set_irq0_channel_mask_enabled(mask, true);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    // Trigger the DMA(s)
-    uint32_t chan_mask = 0;
-    
-    for (int i=0; i<CHANNELS; i+=2)
-    {
-        chan_mask |= 0x01 << dma_channel[i];
-    }
-
-    // Start the PWMs
+    // Build the pwm start mask
     uint32_t pwm_mask = 0;
-    for (int i=0; i<(CHANNELS>>1); ++i)
+    
+    pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
+
+    if (CHANNELS == 2)
     {
-        // Build the start mask
-        pwmChannelAddStartList(&pwm_channel[i], &pwm_mask);
+        // Build the right start mask
+        pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
     }
     
+    // Build the DMA start mask
+    uint32_t chan_mask = 0x01 << dma_channel[0];
+
     // Initialise the buttons
     debounceButtonCreate(&button[0], 20, 40, buttonCallback, true, false);
     debounceButtonCreate(&button[1], 21, 40, buttonCallback, true, false);
     debounceButtonCreate(&button[2], 22, 40, buttonCallback, true, false);
-    debounceButtonCreate(&button[3], 14, 40, buttonCallback, false, true);
+    //debounceButtonCreate(&button[3], 14, 40, buttonCallback, false, true);
 
-    dma_start_channel_mask(chan_mask);
-    pwmChannelStartList(pwm_mask);
+    // Create the event queue
+    enum Event event = empty;
+    queue_init(&eventQueue, sizeof(event), 4);
+
+    /*
+     * Pre-Populate the buffers
+     */
+    // Set up and create the sound double buffers in RAM
+    current_RAM_Buffer[0] = soundBuffersCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+
+    if (CHANNELS == 2)
+    {
+        current_RAM_Buffer[1] = soundBuffersCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+    }
+
+    // Populate the DMA buffers
+    populateDmaBuffer(0);
+    populateDmaBuffer(1);
 
     // Main loop - would generate noise, handle buttons for volume, parse wav blocks etc here 
     // set one shot timer to stop after 40 seconds
     //add_alarm_in_ms(4000, alarm_callback, NULL, false);
-    enum Event event = empty;
 
-    // Create event queue 
-    queue_init(&eventQueue, sizeof(event), 4);
+    // Start the DMA and PWM
+    dma_start_channel_mask(chan_mask);
+    pwmChannelStartList(pwm_mask);
 
     // Process events
     bool cont = true;
@@ -278,6 +320,15 @@ int main(void)
 
             case decrease:
                 volume = fmaxf(0.0, volume-0.1);
+            break;
+
+            case fill_queue:
+                soundBuffersPopulateNext(&double_buffers[0]);
+
+                if (CHANNELS == 2)
+                {
+                    soundBuffersPopulateNext(&double_buffers[1]);
+                }
             break;
 
             case quit:
@@ -322,12 +373,12 @@ void buttonCallback(uint gpio_number, enum debounce_event event)
 void stopMusic()
 {
         
-    for (int i=0; i<(CHANNELS>>1); ++i)
+    for (int i=0; i<(CHANNELS); ++i)
     {
         pwmChannelStop(&pwm_channel[i]);
     }
 
-    for (int i=0; i<CHANNELS; ++i)
+    for (int i=0; i<2; ++i)
     {
         dma_channel_abort(dma_channel[i]);
     }
