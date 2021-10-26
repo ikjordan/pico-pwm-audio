@@ -9,25 +9,33 @@
 #include "pwm_channel.h"
 #include "debounce_button.h"
 #include "sound_buffers.h"
+#include "colour_noise.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
 
+#define NOISE
 /* 
  * This include brings in static arrays which contain audio samples. 
  * if you want to know how to make these please see the python code
  * for converting audio samples into static arrays. 
  */
 //#include "preamble.h"
-#include "panther.h"
+//#include "panther.h"
 //#include "ring.h"
 //#include "sample.h"
-//#include "thats_cool.h"
+#include "thats_cool.h"
 
 #ifdef STEREO
 #define CHANNELS 2
 #else
 #define CHANNELS 1
+#endif
+
+#ifdef NOISE
+#define TWELVE_BIT
+colour_noise cn[CHANNELS];
+void createNoise(uint16_t* buffer, uint len, int id);   // Call back to generate next buffer of noise
 #endif
 
 #ifndef SAMPLE_RATE
@@ -51,7 +59,7 @@ static const int shift = 3;
 static int repeat_shift = 1;                // Defined by the sample rate
 static int wav_position;                    // Holds position for left and right channels
 
-static pwm_data pwm_channel[CHANNELS];   // Represents the PWM channels
+static pwm_data pwm_channel[2];             // Represents the PWM channels
 static int dma_channel[2];
 
  // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
@@ -69,20 +77,37 @@ static sound_buffers double_buffers[CHANNELS];
 // Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
 static const uint16_t* current_RAM_Buffer[CHANNELS];
 
-static float volume = 0.4;                  // Volume adjust, will be controlled by button
+static float volume = 0.4;                  // Initial volume adjust, controlled by button
 
+// Event queue, used to leave ISR context
 queue_t eventQueue;
 
+// Collection of events we support
 enum Event 
 {
     empty = 0,
-    increase = 1, 
-    decrease = 2,
-    fill_queue = 3, 
-    quit = 4, 
+    increase = empty + 1, 
+    decrease = increase + 1,
+    fill_queue = decrease + 1,
+    change = fill_queue + 1,
+    quit = change + 1, 
 }; 
 
+// Range of sound colours we can play
+enum sound_colour
+{
+    white = 0,
+    pink = white + 1,
+    brown = pink + 1,
+    max = brown + 1
+};
+
+// Start with brownian (red) noise
+enum sound_colour colour = brown;
+
+// Four buttons
 static debounce_button_data button[4];
+
 /* 
  * Function declarations
  */
@@ -124,7 +149,7 @@ static void populateDmaBuffer(int buffer_index)
         // Write to buffer, adjusting for volume
         // build the 32 bit word from the two channels
         uint32_t left = (((current_RAM_Buffer[0][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
-        uint32_t right = MID_POINT;
+        uint32_t right = left;
 
         if (CHANNELS == 2)
         {
@@ -136,7 +161,8 @@ static void populateDmaBuffer(int buffer_index)
         if (wav_position < (RAM_BUFFER_LENGTH<<repeat_shift) - 1) 
         { 
             wav_position++;
-        } else 
+        } 
+        else 
         {
             // We need a new RAM buffer
             current_RAM_Buffer[0] = soundBufferGetLast(&double_buffers[0]);
@@ -144,6 +170,7 @@ static void populateDmaBuffer(int buffer_index)
             {
                 current_RAM_Buffer[1] = soundBufferGetLast(&double_buffers[1]);
             }
+
             // reset to start
             wav_position = 0;
 
@@ -229,14 +256,11 @@ int main(void)
     // Set the initial value of the pwm before start
     pwmChannelSetFirstValue(&pwm_channel[0], MID_POINT);
 
-    // Set up the right channel, if in stereo
-    if(CHANNELS == 2)
-    {
-        pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, 1.0f, WRAP);
+    // Set up the right channel
+    pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, 1.0f, WRAP);
 
-        // Set the initial value of the pwm before start
-        pwmChannelSetFirstValue(&pwm_channel[1], MID_POINT);
-    }
+    // Set the initial value of the pwm before start
+    pwmChannelSetFirstValue(&pwm_channel[1], MID_POINT);
 
     // Initialise the DMA(s)
     claimDmaChannels(2);
@@ -263,12 +287,7 @@ int main(void)
     uint32_t pwm_mask = 0;
     
     pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
-
-    if (CHANNELS == 2)
-    {
-        // Build the right start mask
-        pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
-    }
+    pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
     
     // Build the DMA start mask
     uint32_t chan_mask = 0x01 << dma_channel[0];
@@ -277,7 +296,7 @@ int main(void)
     debounceButtonCreate(&button[0], 20, 40, buttonCallback, true, false);
     debounceButtonCreate(&button[1], 21, 40, buttonCallback, true, false);
     debounceButtonCreate(&button[2], 22, 40, buttonCallback, true, false);
-    //debounceButtonCreate(&button[3], 14, 40, buttonCallback, false, true);
+    debounceButtonCreate(&button[3], 14, 40, buttonCallback, false, true);
 
     // Create the event queue
     enum Event event = empty;
@@ -287,25 +306,39 @@ int main(void)
      * Pre-Populate the buffers
      */
     // Set up and create the sound double buffers in RAM
-    current_RAM_Buffer[0] = soundBuffersCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+#ifdef NOISE
+    colourNoiseCreate(&cn[0], 0.5);
+    colourNoiseSeed(&cn[0], 0);
+
+    current_RAM_Buffer[0] = soundBuffersCreateFunction(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, &createNoise, 0);
 
     if (CHANNELS == 2)
     {
-        current_RAM_Buffer[1] = soundBuffersCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+        colourNoiseCreate(&cn[1], 0.5);
+        colourNoiseSeed(&cn[1], 2^15-1);
+
+        current_RAM_Buffer[1] = soundBuffersCreateFunction(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &createNoise, 1);
     }
+#else
+    current_RAM_Buffer[0] = soundBuffersCreateFlash(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+
+    if (CHANNELS == 2)
+    {
+        current_RAM_Buffer[1] = soundBuffersCreateFlash(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+    }
+#endif
 
     // Populate the DMA buffers
     populateDmaBuffer(0);
     populateDmaBuffer(1);
 
-    // Main loop - would generate noise, handle buttons for volume, parse wav blocks etc here 
-    // set one shot timer to stop after 40 seconds
-    //add_alarm_in_ms(4000, alarm_callback, NULL, false);
-
     // Start the DMA and PWM
     dma_start_channel_mask(chan_mask);
     pwmChannelStartList(pwm_mask);
 
+    /*
+     * Main loop Generate noise, handle buttons for volume, parse wav blocks etc
+     */
     // Process events
     bool cont = true;
     while (cont)
@@ -331,6 +364,14 @@ int main(void)
                 }
             break;
 
+            case change:
+                colour += 1;
+                if (colour == max)
+                {
+                    colour = white;
+                }
+            break;
+
             case quit:
                 cont = false;
             break;
@@ -345,6 +386,7 @@ int main(void)
     return 0;
 }
 
+// Called when a button is pressed
 void buttonCallback(uint gpio_number, enum debounce_event event)
 {
     enum Event e = empty;
@@ -352,7 +394,7 @@ void buttonCallback(uint gpio_number, enum debounce_event event)
     switch (gpio_number)
     {
         case 14:
-            e = increase;
+            e = change;
         break;
 
         case 20:
@@ -384,3 +426,38 @@ void stopMusic()
     }
 }
 
+#ifdef NOISE
+void createNoise(uint16_t* buffer, uint len, int id)
+{
+    switch (colour)
+    {
+        case white:
+        {
+            for (int i=0;i<len;++i)
+            {
+                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[id]) + 0.5) * WRAP);
+            }
+        }
+        break;
+
+        case pink:
+        {
+            for (int i=0;i<len;++i)
+            {
+                buffer[i] = (uint16_t)((colourNoisePink(&cn[id]) + 0.5) * WRAP);
+            }
+        }
+        break;
+
+        case brown:
+        {
+            for (int i=0;i<len;++i)
+            {
+                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[id]) + 0.5) * WRAP);
+            }
+        }
+        break;
+    }
+}
+
+#endif
