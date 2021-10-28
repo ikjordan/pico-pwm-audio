@@ -12,10 +12,10 @@
 #include "circular_buffer.h"
 #include "colour_noise.h"
  
-#define AUDIO_PIN 18  // Configured for the Maker board
+#define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
+#define NOISE
 
-//#define NOISE
 /* 
  * This include brings in static arrays which contain audio samples. 
  * if you want to know how to make these please see the python code
@@ -62,18 +62,18 @@ static const int shift = 3;
 #define MID_POINT (WRAP>>1)                 // Equates to mid point in (reduced) 12 bit
 
 static int repeat_shift = 1;                // Defined by the sample rate
-static int wav_position;                    // Holds position for left and right channels
+static int wav_position;                    // Holds current position in ram_buffers for channels
 
 static pwm_data pwm_channel[2];             // Represents the PWM channels
 static int dma_channel[2];
 
  // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
-static uint32_t buffer[2][DMA_BUFFER_LENGTH];
+static uint32_t dma_buffer[2][DMA_BUFFER_LENGTH];
 
 // Have 2 or 4 8k buffers in RAM, copy data from Flash to these buffers - in future
 // will be buffers where noise is created, or music delivered from SD Card
 
-// RAM buffers - currently populated from Flash
+// RAM buffers, controlled through double_buffer class
 static uint16_t ram_buffer[CHANNELS*2][RAM_BUFFER_LENGTH];
 
 // Control data blocks for the RAM double buffers
@@ -140,7 +140,7 @@ static void dmaInterruptHandler()
         {
             dma_channel_acknowledge_irq0(dma_channel[i]);
             populateDmaBuffer(i);
-            dma_channel_set_read_addr(dma_channel[i], buffer[i], false);
+            dma_channel_set_read_addr(dma_channel[i], dma_buffer[i], false);
         }
     }    
 }
@@ -161,7 +161,8 @@ static void populateDmaBuffer(int buffer_index)
             right = (((current_RAM_Buffer[1][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
         }
 
-        buffer[buffer_index][i] = (left << 16) + right;
+        // Combine the two channels
+        dma_buffer[buffer_index][i] = (left << 16) + right;
 
         if (wav_position < (RAM_BUFFER_LENGTH<<repeat_shift) - 1) 
         { 
@@ -209,7 +210,7 @@ static void initDma(int buffer_index, int slice, int chain_index)
     dma_channel_configure(dma_channel[buffer_index], 
                           &config, 
                           &pwm_hw->slice[slice].cc, 
-                          buffer[buffer_index],
+                          dma_buffer[buffer_index],
                           DMA_BUFFER_LENGTH,
                           false);
 }
@@ -277,7 +278,7 @@ int main(void)
     // Set the DMA interrupt handler
     irq_set_exclusive_handler(DMA_IRQ_0, dmaInterruptHandler); 
 
-    // Enable the interrupts, only handle interrupts on left channel
+    // Enable the interrupts for both of the chained dma channels
     int mask = 0;
 
     for (int i=0;i<2;++i)
@@ -307,40 +308,34 @@ int main(void)
     enum Event event = empty;
     queue_init(&eventQueue, sizeof(event), 4);
 
-    /*
-     * Pre-Populate the buffers
-     */
     // Set up and create the sound double buffers in RAM
 #ifdef NOISE
     colourNoiseCreate(&cn[0], 0.5);
     colourNoiseSeed(&cn[0], 0);
-
-    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, &createNoise, 0);
-
-    if (CHANNELS == 2)
-    {
-        colourNoiseCreate(&cn[1], 0.5);
-        colourNoiseSeed(&cn[1], 2^15-1);
-
-        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &createNoise, 1);
-    }
+    populateBuffer fn = &createNoise;
 #else
     circularBufferCreate(&sb[0], WAV_DATA, WAV_DATA_LENGTH);
+    populateBuffer fn = &getSound;
+#endif
 
-    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, &getSound, 0);
+    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, fn, 0);
 
     if (CHANNELS == 2)
     {
+#ifdef NOISE
+        colourNoiseCreate(&cn[1], 0.5);
+        colourNoiseSeed(&cn[1], 2^15-1);
+#else
         circularBufferCreate(&sb[1], WAV_DATA, WAV_DATA_LENGTH);
-        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &getSound, 1);
-    }
 #endif
+        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, fn, 1);
+    }
 
     // Populate the DMA buffers
     populateDmaBuffer(0);
     populateDmaBuffer(1);
 
-    // Start the DMA and PWM
+    // Start the first DMA channel in the chain and both PWMs
     dma_start_channel_mask(chan_mask);
     pwmChannelStartList(pwm_mask);
 
