@@ -8,23 +8,24 @@
 
 #include "pwm_channel.h"
 #include "debounce_button.h"
-#include "sound_buffers.h"
+#include "double_buffer.h"
+#include "circular_buffer.h"
 #include "colour_noise.h"
  
 #define AUDIO_PIN 18  // Configured for the Maker board
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
 
-#define NOISE
+//#define NOISE
 /* 
  * This include brings in static arrays which contain audio samples. 
  * if you want to know how to make these please see the python code
  * for converting audio samples into static arrays. 
  */
 //#include "preamble.h"
-//#include "panther.h"
+#include "panther.h"
 //#include "ring.h"
 //#include "sample.h"
-#include "thats_cool.h"
+//#include "thats_cool.h"
 
 #ifdef STEREO
 #define CHANNELS 2
@@ -36,6 +37,10 @@
 #define TWELVE_BIT
 colour_noise cn[CHANNELS];
 void createNoise(uint16_t* buffer, uint len, int id);   // Call back to generate next buffer of noise
+#else
+// Create 
+circular_buffer sb[CHANNELS];
+void getSound(uint16_t* buffer, uint len, int id);      // Call back to populate buffer from cicrular buffer
 #endif
 
 #ifndef SAMPLE_RATE
@@ -72,7 +77,7 @@ static uint32_t buffer[2][DMA_BUFFER_LENGTH];
 static uint16_t ram_buffer[CHANNELS*2][RAM_BUFFER_LENGTH];
 
 // Control data blocks for the RAM double buffers
-static sound_buffers double_buffers[CHANNELS];
+static double_buffer double_buffers[CHANNELS];
 
 // Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
 static const uint16_t* current_RAM_Buffer[CHANNELS];
@@ -165,10 +170,10 @@ static void populateDmaBuffer(int buffer_index)
         else 
         {
             // We need a new RAM buffer
-            current_RAM_Buffer[0] = soundBufferGetLast(&double_buffers[0]);
+            current_RAM_Buffer[0] = doubleBufferGetLast(&double_buffers[0]);
             if (CHANNELS == 2)            
             {
-                current_RAM_Buffer[1] = soundBufferGetLast(&double_buffers[1]);
+                current_RAM_Buffer[1] = doubleBufferGetLast(&double_buffers[1]);
             }
 
             // reset to start
@@ -310,21 +315,24 @@ int main(void)
     colourNoiseCreate(&cn[0], 0.5);
     colourNoiseSeed(&cn[0], 0);
 
-    current_RAM_Buffer[0] = soundBuffersCreateFunction(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, &createNoise, 0);
+    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, &createNoise, 0);
 
     if (CHANNELS == 2)
     {
         colourNoiseCreate(&cn[1], 0.5);
         colourNoiseSeed(&cn[1], 2^15-1);
 
-        current_RAM_Buffer[1] = soundBuffersCreateFunction(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &createNoise, 1);
+        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &createNoise, 1);
     }
 #else
-    current_RAM_Buffer[0] = soundBuffersCreateFlash(&double_buffers[0], ram_buffer[0], ram_buffer[1],RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+    circularBufferCreate(&sb[0], WAV_DATA, WAV_DATA_LENGTH);
+
+    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, &getSound, 0);
 
     if (CHANNELS == 2)
     {
-        current_RAM_Buffer[1] = soundBuffersCreateFlash(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, WAV_DATA, WAV_DATA_LENGTH);
+        circularBufferCreate(&sb[1], WAV_DATA, WAV_DATA_LENGTH);
+        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, &getSound, 1);
     }
 #endif
 
@@ -356,11 +364,11 @@ int main(void)
             break;
 
             case fill_queue:
-                soundBuffersPopulateNext(&double_buffers[0]);
+                doubleBufferPopulateNext(&double_buffers[0]);
 
                 if (CHANNELS == 2)
                 {
-                    soundBuffersPopulateNext(&double_buffers[1]);
+                    doubleBufferPopulateNext(&double_buffers[1]);
                 }
             break;
 
@@ -459,5 +467,9 @@ void createNoise(uint16_t* buffer, uint len, int id)
         break;
     }
 }
-
+#else
+void getSound(uint16_t* buffer, uint len, int id)
+{
+    circularBufferRead(&sb[id], buffer, len);
+}
 #endif
