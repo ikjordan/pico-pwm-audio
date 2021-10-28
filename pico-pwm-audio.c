@@ -77,7 +77,7 @@ static sound_buffers double_buffers[CHANNELS];
 // Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
 static const uint16_t* current_RAM_Buffer[CHANNELS];
 
-static float volume = 0.4;                  // Initial volume adjust, controlled by button
+static float volume = 0.8;                  // Initial volume adjust, controlled by button
 
 // Event queue, used to leave ISR context
 queue_t eventQueue;
