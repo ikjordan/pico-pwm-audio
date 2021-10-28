@@ -22,9 +22,9 @@
  * for converting audio samples into static arrays. 
  */
 //#include "preamble.h"
-#include "panther.h"
+//#include "panther.h"
 //#include "ring.h"
-//#include "sample.h"
+#include "sample.h"
 //#include "thats_cool.h"
 
 #ifdef STEREO
