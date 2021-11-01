@@ -5,16 +5,22 @@
 #include "hardware/dma.h"  // dma 
 #include "hardware/sync.h" // wait for interrupt 
 #include "pico/util/queue.h" 
+#include "rtc.h"
+#include "f_util.h"
+#include "ff.h"
+#include "hw_config.h"
 
 #include "pwm_channel.h"
 #include "debounce_button.h"
 #include "double_buffer.h"
 #include "circular_buffer.h"
 #include "colour_noise.h"
+#include "wave.h"
+
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
-#define NOISE
+//#define NOISE
 
 /* 
  * This include brings in static arrays which contain audio samples. 
@@ -22,9 +28,9 @@
  * for converting audio samples into static arrays. 
  */
 //#include "preamble.h"
-//#include "panther.h"
+#include "panther.h"
 //#include "ring.h"
-#include "sample.h"
+//#include "sample.h"
 //#include "thats_cool.h"
 
 #ifdef STEREO
@@ -66,6 +72,7 @@ static int wav_position;                    // Holds current position in ram_buf
 
 static pwm_data pwm_channel[2];             // Represents the PWM channels
 static int dma_channel[2];
+static int dma_buffer_index = 0;
 
  // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
 static uint32_t dma_buffer[2][DMA_BUFFER_LENGTH];
@@ -93,8 +100,9 @@ enum Event
     empty = 0,
     increase = empty + 1, 
     decrease = increase + 1,
-    fill_queue = decrease + 1,
-    change = fill_queue + 1,
+    populate_dma = decrease + 1,
+    populate_double = populate_dma + 1,
+    change = populate_double + 1,
     quit = change + 1, 
 }; 
 
@@ -116,7 +124,7 @@ static debounce_button_data button[4];
 /* 
  * Function declarations
  */
-static void populateDmaBuffer(int buffer_index);
+static void populateDmaBuffer(void);
 static void claimDmaChannels(int num_channels);
 static void initDma(int buffer_index, int slice, int chain_index);
 static void dmaInterruptHandler();
@@ -125,28 +133,33 @@ int getRepeatShift(uint sample_rate);
 void stopMusic();
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
+int testSDCard(void);
+int parse_wav(const char* filename);
 /* 
  * Function definitions
  */
 
 // Handles interrupts for the DMA chain
-// Loads next buffer, and ressts start address for DMA
+// Resets start address for DMA and requests buffer that is exhausted to be refilled
 static void dmaInterruptHandler() 
 {
     // Determine which DMA caused the interrupt
     for (int i = 0 ; i<2; ++i)
     {
-        if (dma_channel_get_irq0_status(dma_channel[i]))
+        if (dma_channel_get_irq1_status(dma_channel[i]))
         {
-            dma_channel_acknowledge_irq0(dma_channel[i]);
-            populateDmaBuffer(i);
+            dma_channel_acknowledge_irq1(dma_channel[i]);
             dma_channel_set_read_addr(dma_channel[i], dma_buffer[i], false);
+
+            // Populate buffer outside of IRQ
+            enum Event e = populate_dma;
+            queue_try_add(&eventQueue, &e);
         }
     }    
 }
 
 // Populate the DMA buffer, referenced by index
-static void populateDmaBuffer(int buffer_index)
+static void populateDmaBuffer(void)
 {
     // Populate two bytes from each active buffer
     for (int i=0; i<DMA_BUFFER_LENGTH; ++i)
@@ -162,7 +175,7 @@ static void populateDmaBuffer(int buffer_index)
         }
 
         // Combine the two channels
-        dma_buffer[buffer_index][i] = (left << 16) + right;
+        dma_buffer[dma_buffer_index][i] = (left << 16) + right;
 
         if (wav_position < (RAM_BUFFER_LENGTH<<repeat_shift) - 1) 
         { 
@@ -181,10 +194,11 @@ static void populateDmaBuffer(int buffer_index)
             wav_position = 0;
 
             // Signal to populate a new RAM buffer
-            enum Event e = fill_queue;
+            enum Event e = populate_double;
             queue_try_add(&eventQueue, &e);
         }
     }
+    dma_buffer_index = 1 - dma_buffer_index;
 }
 
 // Obtain the DMA channels - need 2 
@@ -245,14 +259,17 @@ int getRepeatShift(uint sample_rate)
 
 int main(void) 
 {
-    /* Overclocking for fun but then also so the system clock is a 
-     * multiple of typical audio sampling rates.
-     */
-    stdio_init_all();
-
-    // Overclock to 176MHz - assert if cannot be set
+    // Overclock to 176MHz so that system clock is a multiple of typical
+    // audio sampling rates - assert if cannot be set
     set_sys_clock_khz(176000, true);   
     
+    // Adjust clock before initialiing, so serial port will work
+    stdio_init_all();
+    time_init();
+
+    // Test SD Card
+    testSDCard();
+
     // Initialise the repeat shift, based on sampling rate
     repeat_shift = getRepeatShift(SAMPLE_RATE);
 
@@ -276,7 +293,7 @@ int main(void)
     initDma(1, pwmChannelGetSlice(&pwm_channel[0]), 0);
 
     // Set the DMA interrupt handler
-    irq_set_exclusive_handler(DMA_IRQ_0, dmaInterruptHandler); 
+    irq_set_exclusive_handler(DMA_IRQ_1, dmaInterruptHandler); 
 
     // Enable the interrupts for both of the chained dma channels
     int mask = 0;
@@ -286,8 +303,8 @@ int main(void)
         mask |= 0x01 << dma_channel[i];
     }
 
-    dma_set_irq0_channel_mask_enabled(mask, true);
-    irq_set_enabled(DMA_IRQ_0, true);
+    dma_set_irq1_channel_mask_enabled(mask, true);
+    irq_set_enabled(DMA_IRQ_1, true);
 
     // Build the pwm start mask
     uint32_t pwm_mask = 0;
@@ -332,8 +349,8 @@ int main(void)
     }
 
     // Populate the DMA buffers
-    populateDmaBuffer(0);
-    populateDmaBuffer(1);
+    populateDmaBuffer();
+    populateDmaBuffer();
 
     // Start the first DMA channel in the chain and both PWMs
     dma_start_channel_mask(chan_mask);
@@ -358,7 +375,11 @@ int main(void)
                 volume = fmaxf(0.0, volume-0.1);
             break;
 
-            case fill_queue:
+            case populate_dma:
+                populateDmaBuffer();
+            break;
+
+            case populate_double:
                 doubleBufferPopulateNext(&double_buffers[0]);
 
                 if (CHANNELS == 2)
@@ -415,6 +436,7 @@ void buttonCallback(uint gpio_number, enum debounce_event event)
     queue_try_add(&eventQueue, &e);
 }
 
+// Disable DMAs and PWMs
 void stopMusic()
 {
         
@@ -430,6 +452,7 @@ void stopMusic()
 }
 
 #ifdef NOISE
+// Write coloured noise to supplied buffer
 void createNoise(uint16_t* buffer, uint len, int id)
 {
     switch (colour)
@@ -463,8 +486,40 @@ void createNoise(uint16_t* buffer, uint len, int id)
     }
 }
 #else
+// Populate next sound buffer from circular buffer held in Flash
 void getSound(uint16_t* buffer, uint len, int id)
 {
     circularBufferRead(&sb[id], buffer, len);
 }
 #endif
+
+int testSDCard(void)
+{
+    // Detect and mount file
+    sd_card_t *pSD = sd_get_by_num(0);
+    FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+    if (FR_OK != fr)
+    {
+        panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+    }
+    else
+    {
+        printf("Mount ok\n");
+    }
+
+    // test_read_write("filename.txt");
+    //parse_wav("preamble10.wav");
+    //parse_wav("StarWars60.wav");
+    //parse_wav("BabyElephantWalk60.wav");
+    parse_wav("PinkPanther30.wav");
+    //parse_wav("PinkPanther60.wav");
+    //parse_wav("M1F1-int8-AFsp.wav");
+    //parse_wav("M1F1-int16-AFsp.wav");
+    //parse_wav("M1F1-int32-AFsp.wav");
+
+    // Tidy up
+    f_unmount(pSD->pcName);
+
+    printf("End\n");
+    return 0;
+}

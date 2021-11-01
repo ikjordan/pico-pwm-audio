@@ -21,18 +21,27 @@ set(PICO_CXX_ENABLE_RTTI 1)
 # Initialise the Pico SDK
 pico_sdk_init()
 
-# Add executable. Default name is the project name, version 0.1
+# Add executable. Default name is the project name, version 0.2
 
-add_executable(pico-pwm-audio pico-pwm-audio.c pwm_channel.c debounce_button.c double_buffer.c circular_buffer.c colour_noise.c)
+add_executable(pico-pwm-audio pico-pwm-audio.c 
+                              pwm_channel.c 
+                              debounce_button.c 
+                              double_buffer.c 
+                              circular_buffer.c 
+                              colour_noise.c
+                              hw_config.c
+                              wave.c)
 
 pico_set_program_name(pico-pwm-audio "pico-pwm-audio")
-pico_set_program_version(pico-pwm-audio "0.1")
+pico_set_program_version(pico-pwm-audio "0.2")
 
 pico_enable_stdio_uart(pico-pwm-audio 1)
 pico_enable_stdio_usb(pico-pwm-audio 0)
 
+add_subdirectory(no-OS-FatFS-SD-SPI-RPi-Pico/FatFs_SPI build)
+
 # Add the standard library to the build
-target_link_libraries(pico-pwm-audio pico_stdlib)
+target_link_libraries(pico-pwm-audio pico_stdlib FatFs_SPI)
 
 # Add any user requested libraries
 target_link_libraries(pico-pwm-audio
