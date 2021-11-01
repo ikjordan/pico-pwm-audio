@@ -134,7 +134,6 @@ void stopMusic();
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
 int testSDCard(void);
-int parse_wav(const char* filename);
 /* 
  * Function definitions
  */
@@ -453,6 +452,8 @@ void stopMusic()
 
 #ifdef NOISE
 // Write coloured noise to supplied buffer
+// callback function called from circular buffer class
+// len is number of 16 bit samples to copy
 void createNoise(uint16_t* buffer, uint len, int id)
 {
     switch (colour)
@@ -487,11 +488,29 @@ void createNoise(uint16_t* buffer, uint len, int id)
 }
 #else
 // Populate next sound buffer from circular buffer held in Flash
+// Callback function called from circular buffer class
+// len is number of 16 bit samples to copy
 void getSound(uint16_t* buffer, uint len, int id)
 {
     circularBufferRead(&sb[id], buffer, len);
 }
 #endif
+
+static void test_file(wave_file* wf, const char* filename)
+{
+    FIL fil;
+
+    printf("Testing %s ", filename);
+    if (waveFileCreate(wf, &fil, filename))
+    {
+        printf("success\n");
+    }
+    else
+    {
+        printf("failure\n");
+    }
+    waveFileClose(wf);
+}
 
 int testSDCard(void)
 {
@@ -507,15 +526,17 @@ int testSDCard(void)
         printf("Mount ok\n");
     }
 
+    wave_file wf;
+
     // test_read_write("filename.txt");
-    //parse_wav("preamble10.wav");
-    //parse_wav("StarWars60.wav");
-    //parse_wav("BabyElephantWalk60.wav");
-    parse_wav("PinkPanther30.wav");
-    //parse_wav("PinkPanther60.wav");
-    //parse_wav("M1F1-int8-AFsp.wav");
-    //parse_wav("M1F1-int16-AFsp.wav");
-    //parse_wav("M1F1-int32-AFsp.wav");
+    test_file(&wf, "preamble10.wav");
+    //test_file(&wf, "StarWars60.wav");
+    //test_file(&wf, "BabyElephantWalk60.wav");
+    test_file(&wf, "PinkPanther30.wav");
+    //test_file(&wf, "PinkPanther60.wav");
+    test_file(&wf, "M1F1-int8-AFsp.wav");
+    test_file(&wf, "M1F1-int16-AFsp.wav");
+    test_file(&wf, "M1F1-int32-AFsp.wav");
 
     // Tidy up
     f_unmount(pSD->pcName);

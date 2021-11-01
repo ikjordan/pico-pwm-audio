@@ -13,6 +13,7 @@ void circularBufferCreate(circular_buffer* cb, const uint16_t* buff, uint buffer
 }
 
 // Populate destination from the circular buffer
+// len is the number of samples to copy
 void circularBufferRead(circular_buffer* cb, uint16_t* dest, uint len)
 {
     for (int i=0; i<len ; ++i)
