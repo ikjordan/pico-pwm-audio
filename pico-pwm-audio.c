@@ -19,7 +19,7 @@
 
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
-#define STEREO        // When stereo enabled, currently DMA same data to both channels
+//#define STEREO        // When stereo enabled, currently DMA same data to both channels
 //#define NOISE
 
 /* 
@@ -47,6 +47,8 @@ void createNoise(uint16_t* buffer, uint len, int id);   // Call back to generate
 // Create 
 circular_buffer sb[CHANNELS];
 void getSound(uint16_t* buffer, uint len, int id);      // Call back to populate buffer from cicrular buffer
+void getFileSound(uint16_t* buffer, uint len, int id);  // Call back to populate buffer from file
+
 #endif
 
 #ifndef SAMPLE_RATE
@@ -85,6 +87,10 @@ static uint16_t ram_buffer[CHANNELS*2][RAM_BUFFER_LENGTH];
 
 // Control data blocks for the RAM double buffers
 static double_buffer double_buffers[CHANNELS];
+
+static wave_file wf;
+sd_card_t* pSD;
+FIL fil;
 
 // Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
 static const uint16_t* current_RAM_Buffer[CHANNELS];
@@ -134,6 +140,7 @@ void stopMusic();
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
 int testSDCard(void);
+bool mount(void);
 /* 
  * Function definitions
  */
@@ -241,10 +248,12 @@ int getRepeatShift(uint sample_rate)
         break;
 
         case 22000:
+        case 22050:
             ret = 1;
         break;
 
         case 44000:
+        case 44100:
             ret = 0;
         break;
 
@@ -266,11 +275,22 @@ int main(void)
     stdio_init_all();
     time_init();
 
-    // Test SD Card
-    testSDCard();
-
     // Initialise the repeat shift, based on sampling rate
     repeat_shift = getRepeatShift(SAMPLE_RATE);
+
+    // Test SD Card
+    //testSDCard();
+    if (mount())
+    {
+        if (!waveFileCreate(&wf, &fil, "PinkPanther60.wav"))
+        {
+            panic("Cannot open file\n");
+        }
+        else
+        {
+            repeat_shift = getRepeatShift(wf.sample_rate);
+        }
+    }
 
     // Set up the PWMs - A single pwm period will be 176 MHz / WRAP = 44 kHz
     pwmChannelInit(&pwm_channel[0], AUDIO_PIN, 1.0f, WRAP);
@@ -330,8 +350,9 @@ int main(void)
     colourNoiseSeed(&cn[0], 0);
     populateBuffer fn = &createNoise;
 #else
-    circularBufferCreate(&sb[0], WAV_DATA, WAV_DATA_LENGTH);
-    populateBuffer fn = &getSound;
+    //circularBufferCreate(&sb[0], WAV_DATA, WAV_DATA_LENGTH);
+    //populateBuffer fn = &getSound;
+    populateBuffer fn = &getFileSound;
 #endif
 
     current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, fn, 0);
@@ -448,6 +469,7 @@ void stopMusic()
     {
         dma_channel_abort(dma_channel[i]);
     }
+    f_unmount(pSD->pcName);
 }
 
 #ifdef NOISE
@@ -494,6 +516,11 @@ void getSound(uint16_t* buffer, uint len, int id)
 {
     circularBufferRead(&sb[id], buffer, len);
 }
+
+void getFileSound(uint16_t* buffer, uint len, int id)
+{
+    waveFileRead(&wf, buffer, len);
+}
 #endif
 
 static void test_file(wave_file* wf, const char* filename)
@@ -510,6 +537,22 @@ static void test_file(wave_file* wf, const char* filename)
         printf("failure\n");
     }
     waveFileClose(wf);
+}
+
+bool mount(void)
+{
+    pSD = sd_get_by_num(0);
+    FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+    if (FR_OK != fr)
+    {
+        printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+        return false;
+    }
+    else
+    {
+        printf("Mount ok\n");
+        return true;
+    }
 }
 
 int testSDCard(void)
