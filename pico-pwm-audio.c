@@ -277,6 +277,7 @@ int main(void)
 
     // Initialise the repeat shift, based on sampling rate
     repeat_shift = getRepeatShift(SAMPLE_RATE);
+    uint32_t wrap = WRAP;
 
     // Test SD Card
     //testSDCard();
@@ -289,11 +290,12 @@ int main(void)
         else
         {
             repeat_shift = getRepeatShift(wf.sample_rate);
+            wrap = 1995;
         }
     }
 
     // Set up the PWMs - A single pwm period will be 176 MHz / WRAP = 44 kHz
-    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, 1.0f, WRAP);
+    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, 1.0f, wrap);
 
     // Set the initial value of the pwm before start
     pwmChannelSetFirstValue(&pwm_channel[0], MID_POINT);

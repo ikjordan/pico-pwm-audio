@@ -294,9 +294,9 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
         // Update the current position in the file, and handle wrap is needed
         wf->current_pos += read;
 
-        if (wf->current_pos == wf->data_offset)
+        if (wf->current_pos == wf->data_size)
         {
-            printf("file wrap\n", read);
+            STATUS(("file wrap\n"));
 
             // seek back to start of data in file
             f_lseek(wf->fil, wf->data_offset);
