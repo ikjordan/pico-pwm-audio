@@ -65,7 +65,7 @@ static uint wrap;                           // Largest value a sample can be + 1
 static int mid_point;                       // wrap divided by 2
 static float fraction = 1;                  // Divider used for PWM
 static int repeat_shift = 1;                // Defined by the sample rate
-static int wav_position;                    // Holds current position in ram_buffers for channels
+static int wav_position = 0;                // Holds current position in ram_buffers for channels
 
 static pwm_data pwm_channel[2];             // Represents the PWM channels
 static int dma_channel[2];                  // The 2 DMA channels used for DMA ping pong
@@ -137,7 +137,7 @@ void stopMusic();
 void pauseMusic();
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
-static bool attemptFile(const char* filename);
+static bool playFile(const char* filename);
 static bool mount(void);
 static void unmount(void);
 static bool mounted = false;
@@ -192,7 +192,7 @@ static void populateDmaBuffer(void)
             // Need a new RAM buffer
             current_RAM_Buffer = doubleBufferGetLast(&double_buffers);
 
-            // reset to start
+            // reset read position of RAM buffer to start
             wav_position = 0;
 
             // Signal to populate a new RAM buffer
@@ -313,15 +313,6 @@ int main(void)
     // Attempt to mount the file system
     mount();
 
-    if (mounted)
-    {
-        printf("Mounted\n");
-    }
-    else
-    {
-        printf("Mount failed");
-    }
-
     // Set up the PWMs
     pwmChannelInit(&pwm_channel[0], AUDIO_PIN, fraction, wrap);
 
@@ -429,9 +420,8 @@ int main(void)
                 }
                 else if (colour == file_1)
                 {
-                    printf("colour = file_1");
                     // Need to swap to file_1, but only if mounted
-                    if (!attemptFile("PinkPanther60.wav"));
+                    if (!playFile("PinkPanther60.wav"));
                     {
                         colour = white;
                     }
@@ -481,16 +471,11 @@ void buttonCallback(uint gpio_number, enum debounce_event event)
 // Disable DMAs and PWMs
 void pauseMusic()
 {
-        
-    for (int i=0; i<2; ++i)
-    {
-        pwmChannelStop(&pwm_channel[i]);
-    }
+    pwmChannelStop(&pwm_channel[0]);
+    pwmChannelStop(&pwm_channel[1]);
 
-    for (int i=0; i<2; ++i)
-    {
-        dma_channel_abort(dma_channel[i]);
-    }
+    dma_channel_abort(dma_channel[0]);
+    dma_channel_abort(dma_channel[1]);
 }
 
 void stopMusic()
@@ -563,7 +548,6 @@ static bool mount(void)
         }
         else
         {
-            printf("Mount ok\n");
             mounted = true;
         }
     }
@@ -576,11 +560,9 @@ static void unmount(void)
     f_unmount(pSD->pcName);
 }
 
-static bool attemptFile(const char* filename)
+static bool playFile(const char* filename)
 {
     bool ret = false;
-
-    printf("in attempt file\n");
 
     if (mounted)
     {
@@ -590,15 +572,23 @@ static bool attemptFile(const char* filename)
         }
         else
         {
-            // File opened
+            // Stop the PWM and DMA
             pauseMusic();
 
+            // Empty the message queue, to avoid processing populate messages
+            enum Event skip = empty;
+            while(queue_try_remove(&eventQueue, &skip));
+
+            // Reconfigure the PWM for the new wrap and clock
             getRepeatShift(wf.sample_rate, &repeat_shift, &wrap, &mid_point, &fraction);
             pwmChannelReconfigure(&pwm_channel[0], fraction, wrap);
             pwmChannelReconfigure(&pwm_channel[1], fraction, wrap);
 
             // Reininitialise the double buffers
             current_RAM_Buffer = doubleBufferRestart(&double_buffers, &getFileSound);
+
+            // reset read position of RAM buffer to start
+            wav_position = 0;
 
             // Populate the DMA buffers
             populateDmaBuffer();
@@ -612,9 +602,6 @@ static bool attemptFile(const char* filename)
     
             // Build the DMA start mask
             uint32_t chan_mask = 0x01 << dma_channel[0];
-
-            sleep_ms(5000);
-            printf("restarting...");
 
             dma_start_channel_mask(chan_mask);
             pwmChannelStartList(pwm_mask);

@@ -11,8 +11,6 @@ typedef struct double_buffer
     uint16_t* buffers[2];            // Address of buffers
     uint      buffer_len;            // Length of buffers
     populateBuffer fn;               // Population function
-    int       id;                    // Id passed to population function
-
 } double_buffer;
 
 // Create the buffers
