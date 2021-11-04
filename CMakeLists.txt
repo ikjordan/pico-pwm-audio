@@ -30,7 +30,7 @@ add_executable(pico-pwm-audio pico-pwm-audio.c
                               circular_buffer.c 
                               colour_noise.c
                               hw_config.c
-                              wave.c)
+                              wave_file.c)
 
 pico_set_program_name(pico-pwm-audio "pico-pwm-audio")
 pico_set_program_version(pico-pwm-audio "0.2")

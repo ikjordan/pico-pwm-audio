@@ -15,11 +15,11 @@
 #include "double_buffer.h"
 #include "circular_buffer.h"
 #include "colour_noise.h"
-#include "wave.h"
+#include "wave_file.h"
 
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
-//#define STEREO        // When stereo enabled, currently DMA same data to both channels
+#define STEREO        // When stereo enabled, currently DMA same data to both channels
 //#define NOISE
 
 /* 
@@ -28,35 +28,30 @@
  * for converting audio samples into static arrays. 
  */
 //#include "preamble.h"
-#include "panther.h"
-//#include "ring.h"
+//#include "panther.h"
+#include "ring.h"
 //#include "sample.h"
 //#include "thats_cool.h"
 
 #ifdef STEREO
-#define CHANNELS 2
+bool stereo = true;
 #else
-#define CHANNELS 1
+bool stereo = false;
 #endif
 
-#ifdef NOISE
-#define TWELVE_BIT
-colour_noise cn[CHANNELS];
-void createNoise(uint16_t* buffer, uint len, int id);   // Call back to generate next buffer of noise
-#else
-// Create 
-circular_buffer sb[CHANNELS];
-void getSound(uint16_t* buffer, uint len, int id);      // Call back to populate buffer from cicrular buffer
-void getFileSound(uint16_t* buffer, uint len, int id);  // Call back to populate buffer from file
+colour_noise cn[2];
+void createNoise(uint16_t* buffer, uint len);   // Call back to generate next buffer of noise
 
-#endif
+static circular_buffer sb;
+void getSound(uint16_t* buffer, uint len);      // Call back to populate buffer from cicrular buffer
+void getFileSound(uint16_t* buffer, uint len);  // Call back to populate buffer from file
 
 #ifndef SAMPLE_RATE
 #define SAMPLE_RATE 11000
 #endif
 #define DMA_BUFFER_LENGTH 2200      // 2200 samples @ 44kHz gives= 0.05 seconds = interrupt rate
 
-#define RAM_BUFFER_LENGTH (2*DMA_BUFFER_LENGTH)
+#define RAM_BUFFER_LENGTH (4*DMA_BUFFER_LENGTH)
 /*
  * Static variable definitions
  */
@@ -66,15 +61,15 @@ static const int shift = 0;
 static const int shift = 3;
 #endif
 
-#define WRAP 4000                           // Maximum value for (reduced) 12 bit
-#define MID_POINT (WRAP>>1)                 // Equates to mid point in (reduced) 12 bit
-
+static uint wrap;                           // Largest value a sample can be + 1
+static int mid_point;                       // wrap divided by 2
+static float fraction = 1;                  // Divider used for PWM
 static int repeat_shift = 1;                // Defined by the sample rate
 static int wav_position;                    // Holds current position in ram_buffers for channels
 
 static pwm_data pwm_channel[2];             // Represents the PWM channels
-static int dma_channel[2];
-static int dma_buffer_index = 0;
+static int dma_channel[2];                  // The 2 DMA channels used for DMA ping pong
+static int dma_buffer_index = 0;            // Index into active DMA buffer
 
  // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
 static uint32_t dma_buffer[2][DMA_BUFFER_LENGTH];
@@ -83,22 +78,22 @@ static uint32_t dma_buffer[2][DMA_BUFFER_LENGTH];
 // will be buffers where noise is created, or music delivered from SD Card
 
 // RAM buffers, controlled through double_buffer class
-static uint16_t ram_buffer[CHANNELS*2][RAM_BUFFER_LENGTH];
+static uint16_t ram_buffer[2][RAM_BUFFER_LENGTH];
 
 // Control data blocks for the RAM double buffers
-static double_buffer double_buffers[CHANNELS];
+static double_buffer double_buffers;
 
 static wave_file wf;
-sd_card_t* pSD;
-FIL fil;
+static sd_card_t* pSD;
+static FIL fil;
 
-// Pointers to the currenly in use RAM buffers - one pointer for left and (optionally) one for right
-static const uint16_t* current_RAM_Buffer[CHANNELS];
+// Pointer to the currenly in use RAM buffer
+static const uint16_t* current_RAM_Buffer;
 
 static float volume = 0.8;                  // Initial volume adjust, controlled by button
 
 // Event queue, used to leave ISR context
-queue_t eventQueue;
+static queue_t eventQueue;
 
 // Collection of events we support
 enum Event 
@@ -112,13 +107,15 @@ enum Event
     quit = change + 1, 
 }; 
 
-// Range of sound colours we can play
+// Range of sound colours and files we can play
 enum sound_colour
 {
     white = 0,
     pink = white + 1,
     brown = pink + 1,
-    max = brown + 1
+    file_1 = brown + 1,
+    file_2 = file_1 + 1,
+    max = file_2
 };
 
 // Start with brownian (red) noise
@@ -134,13 +131,17 @@ static void populateDmaBuffer(void);
 static void claimDmaChannels(int num_channels);
 static void initDma(int buffer_index, int slice, int chain_index);
 static void dmaInterruptHandler();
-int getRepeatShift(uint sample_rate);
+static bool getRepeatShift(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction);
 
 void stopMusic();
+void pauseMusic();
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
-int testSDCard(void);
-bool mount(void);
+static bool attemptFile(const char* filename);
+static bool mount(void);
+static void unmount(void);
+static bool mounted = false;
+
 /* 
  * Function definitions
  */
@@ -172,29 +173,24 @@ static void populateDmaBuffer(void)
     {
         // Write to buffer, adjusting for volume
         // build the 32 bit word from the two channels
-        uint32_t left = (((current_RAM_Buffer[0][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
-        uint32_t right = left;
+        uint32_t left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
+        uint32_t right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
+        wav_position++;
 
-        if (CHANNELS == 2)
+        if (!stereo)
         {
-            right = (((current_RAM_Buffer[1][wav_position>>repeat_shift] << shift) - MID_POINT) * volume) + MID_POINT;
+            // Want mono, so average two channels
+            left = (left + right) >> 1;
+            right = left;
         }
 
         // Combine the two channels
         dma_buffer[dma_buffer_index][i] = (left << 16) + right;
 
-        if (wav_position < (RAM_BUFFER_LENGTH<<repeat_shift) - 1) 
-        { 
-            wav_position++;
-        } 
-        else 
+        if ((wav_position<<1) == (RAM_BUFFER_LENGTH<<repeat_shift)) 
         {
-            // We need a new RAM buffer
-            current_RAM_Buffer[0] = doubleBufferGetLast(&double_buffers[0]);
-            if (CHANNELS == 2)            
-            {
-                current_RAM_Buffer[1] = doubleBufferGetLast(&double_buffers[1]);
-            }
+            // Need a new RAM buffer
+            current_RAM_Buffer = doubleBufferGetLast(&double_buffers);
 
             // reset to start
             wav_position = 0;
@@ -237,29 +233,65 @@ static void initDma(int buffer_index, int slice, int chain_index)
 
 // Determine how often a value needs to be repeated, based on the sampling rate
 // If repeat is 2^m return m
-int getRepeatShift(uint sample_rate)
+static bool getRepeatShift(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction)
 {
-    int ret;
+    bool ret = true;
     // Determine the repeat rate
     switch (sample_rate)
     {
         case 11000:
-            ret = 2;
+            *shift = 2;
+            *wrap = 4091;
+            *fraction = 1.0f;
         break;
 
         case 22000:
+            *shift = 1;
+            *wrap = 4091;
+            *fraction = 1.0f;
+        break;
+
         case 22050:
-            ret = 1;
+            *shift = 1;
+            *wrap = 4082;
+            *fraction = 1.0f;
         break;
 
         case 44000:
+            *shift = 0;
+            *wrap = 4091;
+            *fraction = 1.0f;
+        break;
+
         case 44100:
-            ret = 0;
+            *shift = 0;
+            *wrap = 4082;
+            *fraction = 1.0f;
+        break;
+
+        case 8000:
+            *shift = 2;
+            *wrap = 4091;
+            *fraction = 1.375f;
+        break;
+
+        case 16000:
+            *shift = 1;
+            *wrap = 4091;
+            *fraction = 1.375f;
+        break;
+
+        case 32000:
+            *shift = 0;
+            *wrap = 4091;
+            *fraction = 1.375f;
         break;
 
         default:
             // Not a supported rate
-            ret = -1;
+            *wrap = 0;
+            *mid_point = *wrap >> 1;
+            ret = false;
         break;
     }
     return ret;
@@ -269,42 +301,38 @@ int main(void)
 {
     // Overclock to 176MHz so that system clock is a multiple of typical
     // audio sampling rates - assert if cannot be set
-    set_sys_clock_khz(176000, true);   
+    set_sys_clock_khz(180000, true);   
     
     // Adjust clock before initialiing, so serial port will work
     stdio_init_all();
     time_init();
 
     // Initialise the repeat shift, based on sampling rate
-    repeat_shift = getRepeatShift(SAMPLE_RATE);
-    uint32_t wrap = WRAP;
+    getRepeatShift(SAMPLE_RATE, &repeat_shift, &wrap, &mid_point, &fraction);
 
-    // Test SD Card
-    //testSDCard();
-    if (mount())
+    // Attempt to mount the file system
+    mount();
+
+    if (mounted)
     {
-        if (!waveFileCreate(&wf, &fil, "PinkPanther60.wav"))
-        {
-            panic("Cannot open file\n");
-        }
-        else
-        {
-            repeat_shift = getRepeatShift(wf.sample_rate);
-            wrap = 1995;
-        }
+        printf("Mounted\n");
+    }
+    else
+    {
+        printf("Mount failed");
     }
 
-    // Set up the PWMs - A single pwm period will be 176 MHz / WRAP = 44 kHz
-    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, 1.0f, wrap);
+    // Set up the PWMs
+    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, fraction, wrap);
 
     // Set the initial value of the pwm before start
-    pwmChannelSetFirstValue(&pwm_channel[0], MID_POINT);
+    pwmChannelSetFirstValue(&pwm_channel[0], mid_point);
 
     // Set up the right channel
-    pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, 1.0f, WRAP);
+    pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, fraction, wrap);
 
     // Set the initial value of the pwm before start
-    pwmChannelSetFirstValue(&pwm_channel[1], MID_POINT);
+    pwmChannelSetFirstValue(&pwm_channel[1], mid_point);
 
     // Initialise the DMA(s)
     claimDmaChannels(2);
@@ -347,28 +375,16 @@ int main(void)
     queue_init(&eventQueue, sizeof(event), 4);
 
     // Set up and create the sound double buffers in RAM
-#ifdef NOISE
     colourNoiseCreate(&cn[0], 0.5);
     colourNoiseSeed(&cn[0], 0);
+    colourNoiseCreate(&cn[1], 0.5);
+    colourNoiseSeed(&cn[1], 2^15-1);
     populateBuffer fn = &createNoise;
-#else
-    //circularBufferCreate(&sb[0], WAV_DATA, WAV_DATA_LENGTH);
+    //circularBufferCreate(&sb, WAV_DATA, WAV_DATA_LENGTH, shift);
     //populateBuffer fn = &getSound;
-    populateBuffer fn = &getFileSound;
-#endif
 
-    current_RAM_Buffer[0] = doubleBufferCreate(&double_buffers[0], ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, fn, 0);
-
-    if (CHANNELS == 2)
-    {
-#ifdef NOISE
-        colourNoiseCreate(&cn[1], 0.5);
-        colourNoiseSeed(&cn[1], 2^15-1);
-#else
-        circularBufferCreate(&sb[1], WAV_DATA, WAV_DATA_LENGTH);
-#endif
-        current_RAM_Buffer[1] = doubleBufferCreate(&double_buffers[1], ram_buffer[2], ram_buffer[3], RAM_BUFFER_LENGTH, fn, 1);
-    }
+    // Start with coloured noise
+    current_RAM_Buffer = doubleBufferCreate(&double_buffers, ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, fn);
 
     // Populate the DMA buffers
     populateDmaBuffer();
@@ -402,12 +418,7 @@ int main(void)
             break;
 
             case populate_double:
-                doubleBufferPopulateNext(&double_buffers[0]);
-
-                if (CHANNELS == 2)
-                {
-                    doubleBufferPopulateNext(&double_buffers[1]);
-                }
+                doubleBufferPopulateNext(&double_buffers);
             break;
 
             case change:
@@ -415,6 +426,15 @@ int main(void)
                 if (colour == max)
                 {
                     colour = white;
+                }
+                else if (colour == file_1)
+                {
+                    printf("colour = file_1");
+                    // Need to swap to file_1, but only if mounted
+                    if (!attemptFile("PinkPanther60.wav"));
+                    {
+                        colour = white;
+                    }
                 }
             break;
 
@@ -459,10 +479,10 @@ void buttonCallback(uint gpio_number, enum debounce_event event)
 }
 
 // Disable DMAs and PWMs
-void stopMusic()
+void pauseMusic()
 {
         
-    for (int i=0; i<(CHANNELS); ++i)
+    for (int i=0; i<2; ++i)
     {
         pwmChannelStop(&pwm_channel[i]);
     }
@@ -471,121 +491,134 @@ void stopMusic()
     {
         dma_channel_abort(dma_channel[i]);
     }
-    f_unmount(pSD->pcName);
 }
 
-#ifdef NOISE
+void stopMusic()
+{
+    pauseMusic();
+    unmount();
+}
+
 // Write coloured noise to supplied buffer
 // callback function called from circular buffer class
 // len is number of 16 bit samples to copy
-void createNoise(uint16_t* buffer, uint len, int id)
+void createNoise(uint16_t* buffer, uint len)
 {
     switch (colour)
     {
         case white:
         {
-            for (int i=0;i<len;++i)
+            for (int i=0;i<len;i+=2)
             {
-                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[id]) + 0.5) * WRAP);
+                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[0]) + 0.5) * wrap);
+                buffer[i+1] = (uint16_t)((colourNoiseWhite(&cn[1]) + 0.5) * wrap);
             }
         }
         break;
 
         case pink:
         {
-            for (int i=0;i<len;++i)
+            for (int i=0;i<len;i+=2)
             {
-                buffer[i] = (uint16_t)((colourNoisePink(&cn[id]) + 0.5) * WRAP);
+                buffer[i] = (uint16_t)((colourNoisePink(&cn[0]) + 0.5) * wrap);
+                buffer[i+1] = (uint16_t)((colourNoisePink(&cn[1]) + 0.5) * wrap);
             }
         }
         break;
 
         case brown:
         {
-            for (int i=0;i<len;++i)
+            for (int i=0;i<len;i+=2)
             {
-                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[id]) + 0.5) * WRAP);
+                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[0]) + 0.5) * wrap);
+                buffer[i+1] = (uint16_t)((colourNoiseBrown(&cn[1]) + 0.5) * wrap);
             }
         }
         break;
     }
 }
-#else
+
 // Populate next sound buffer from circular buffer held in Flash
 // Callback function called from circular buffer class
 // len is number of 16 bit samples to copy
-void getSound(uint16_t* buffer, uint len, int id)
+void getSound(uint16_t* buffer, uint len)
 {
-    circularBufferRead(&sb[id], buffer, len);
+    circularBufferRead(&sb, buffer, len);
 }
 
-void getFileSound(uint16_t* buffer, uint len, int id)
+void getFileSound(uint16_t* buffer, uint len)
 {
     waveFileRead(&wf, buffer, len);
 }
-#endif
 
-static void test_file(wave_file* wf, const char* filename)
+static bool mount(void)
 {
-    FIL fil;
-
-    printf("Testing %s ", filename);
-    if (waveFileCreate(wf, &fil, filename))
+    if (!mounted)
     {
-        printf("success\n");
+        pSD = sd_get_by_num(0);
+        FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+        if (FR_OK != fr)
+        {
+            printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+        }
+        else
+        {
+            printf("Mount ok\n");
+            mounted = true;
+        }
     }
-    else
-    {
-        printf("failure\n");
-    }
-    waveFileClose(wf);
+    return mounted;
 }
 
-bool mount(void)
+static void unmount(void)
 {
-    pSD = sd_get_by_num(0);
-    FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
-    if (FR_OK != fr)
-    {
-        printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-        return false;
-    }
-    else
-    {
-        printf("Mount ok\n");
-        return true;
-    }
-}
-
-int testSDCard(void)
-{
-    // Detect and mount file
-    sd_card_t *pSD = sd_get_by_num(0);
-    FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
-    if (FR_OK != fr)
-    {
-        panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-    }
-    else
-    {
-        printf("Mount ok\n");
-    }
-
-    wave_file wf;
-
-    // test_read_write("filename.txt");
-    test_file(&wf, "preamble10.wav");
-    //test_file(&wf, "StarWars60.wav");
-    //test_file(&wf, "BabyElephantWalk60.wav");
-    test_file(&wf, "PinkPanther30.wav");
-    //test_file(&wf, "PinkPanther60.wav");
-    test_file(&wf, "M1F1-int8-AFsp.wav");
-    test_file(&wf, "M1F1-int16-AFsp.wav");
-    test_file(&wf, "M1F1-int32-AFsp.wav");
-
-    // Tidy up
+    mounted = false;   
     f_unmount(pSD->pcName);
+}
 
-    printf("End\n");
-    return 0;
+static bool attemptFile(const char* filename)
+{
+    bool ret = false;
+
+    printf("in attempt file\n");
+
+    if (mounted)
+    {
+        if (!waveFileCreate(&wf, &fil, filename))
+        {
+            printf("Cannot open file: %s\n", filename);
+        }
+        else
+        {
+            // File opened
+            pauseMusic();
+
+            getRepeatShift(wf.sample_rate, &repeat_shift, &wrap, &mid_point, &fraction);
+            pwmChannelReconfigure(&pwm_channel[0], fraction, wrap);
+            pwmChannelReconfigure(&pwm_channel[1], fraction, wrap);
+
+            // Reininitialise the double buffers
+            current_RAM_Buffer = doubleBufferRestart(&double_buffers, &getFileSound);
+
+            // Populate the DMA buffers
+            populateDmaBuffer();
+            populateDmaBuffer();
+
+            // Start the first DMA channel in the chain and both PWMs
+            uint32_t pwm_mask = 0;
+    
+            pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
+            pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
+    
+            // Build the DMA start mask
+            uint32_t chan_mask = 0x01 << dma_channel[0];
+
+            sleep_ms(5000);
+            printf("restarting...");
+
+            dma_start_channel_mask(chan_mask);
+            pwmChannelStartList(pwm_mask);
+        }
+    }
+    return ret;
 }

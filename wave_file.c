@@ -8,7 +8,7 @@
 #include "ff.h"
 #include "pico/stdlib.h"
 #include <stdbool.h>
-#include "wave.h"
+#include "wave_file.h"
 
 #define CACHE_BUFFER 4096
 
@@ -231,20 +231,20 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
     // 1) Remaining space in destination buffer
     // 2) Size of the cache buffer
     // 3) Data in file, before wrap
+    // Sample = data for each supported channel (so 4 bytes for 16 bit stereo)
 
-    // Initially work for mono
-    uint32_t samples_left = len;
-    //uint32_t samples_left = len / wf->channels;     // Number of samples to write to one channel
-    uint32_t cache_samples_size = CACHE_BUFFER / wf->sample_size;
-    uint32_t data_index = 0;
-    uint32_t samples_to_read;
-    uint32_t samples_to_wrap;
+    uint32_t samples_left = len >> 1;         // Number of samples left to write to destination buffer
+                                              // Note always write two samples (for l and r channels)
+    uint32_t cache_samples_size = CACHE_BUFFER / wf->sample_size; // Number of samples that fit in read cache
+    uint32_t data_index = 0;                           // Index into destination buffer
+    uint32_t samples_to_read;                          // Number of samples to read from file next read instance
+    uint32_t samples_to_wrap;                          // Samples left to read from file before reaching EOF
     uint read;
     
     // Take the smaller of the read buffer size and the destination size
     while (samples_left)
     {
-        // Calculate the number that can be read before a file wrap
+        // Calculate the number of samples that can be read before a file wrap
         samples_to_wrap = (wf->data_size - wf->current_pos) / wf->sample_size;
 
         // The smaller of the number to fill the destination, or the holding buffer
@@ -262,18 +262,44 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
         switch (wf->bits_per_sample)
         {
             case 8:
-                for (int i = 0; i < samples_to_read; ++i)
+                if (wf->channels == 2)
                 {
-                    dest[data_index++] = ((uint16_t)(cache_buffer[i])) << 4;
-                    //data_buffer[1][data_index] = (wf->channels == 2) ? ((uint16_t)(cache_buffer[i])) << 4: dest[data_index];
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        dest[data_index++] = ((uint16_t)(cache_buffer[i<<1])) << 4;
+                        dest[data_index++] = ((uint16_t)(cache_buffer[(i<<1)+1])) << 4;
+                    }
+                }
+                else
+                {
+                    // Mono, so duplicate sample
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        dest[data_index] = ((uint16_t)(cache_buffer[i])) << 4;
+                        dest[data_index+1] = dest[data_index];
+                        data_index += 2;
+                    }
                 }
             break;
 
             case 16:
-                for (int i = 0; i < samples_to_read; ++i)
+                if (wf->channels == 2)
                 {
-                    dest[data_index++] = (cache_buffer_16[i] + 0x8000) >> 4;
-                    //dest[data_index] = (wf->channels == 2) ? ((cache_buffer_16[i] + 0x8000) >> 4): dest[data_index];
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        dest[data_index++] = (cache_buffer_16[i<<1] + 0x8000) >> 4;
+                        dest[data_index++] =((cache_buffer_16[(i<<1)+1] + 0x8000) >> 4);
+                    }
+                }
+                else
+                {
+                    // Mono, so duplicate sample
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        dest[data_index] = (cache_buffer_16[i] + 0x8000) >> 4;
+                        dest[data_index+1] = dest[data_index];
+                        data_index += 2;
+                    }
                 }
             break;
 
@@ -281,17 +307,30 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
             {
                 uint32_t temp_l;
                 uint32_t temp_r;
-                for (int i = 0; i < samples_to_read; ++i)
+                if (wf->channels == 2)
                 {
-                    temp_l = (cache_buffer_32[i] + 0x80000000) >> 20;
-                    //temp_r = (wf->channels == 2) ? ((cache_buffer_32[i] + 0x80000000) >> 20): temp_l;
-                    dest[data_index++] = (uint16_t)temp_l;
-                    //dest[data_index] = (uint16_t)temp_r;
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        temp_l = (cache_buffer_32[i<<1] + 0x80000000) >> 20;
+                        temp_r = (cache_buffer_32[(i<<1)+1] + 0x80000000) >> 20;
+                        dest[data_index++] = (uint16_t)temp_l;
+                        dest[data_index++] = (uint16_t)temp_r;
+                    }
+                }
+                else
+                {
+                    // Mono, so duplicate sample
+                    for (int i = 0; i < samples_to_read; ++i)
+                    {
+                        temp_l = (cache_buffer_32[i] + 0x80000000) >> 20;;
+                        dest[data_index++] = (uint16_t)temp_l;
+                        dest[data_index++] = (uint16_t)temp_l;
+                    }
                 }
             }
             break;
         }
-        // Update the current position in the file, and handle wrap is needed
+        // Update the current position in the file, and wrap if needed
         wf->current_pos += read;
 
         if (wf->current_pos == wf->data_size)

@@ -5,10 +5,11 @@
  */
 
 // Create the buffers
-void circularBufferCreate(circular_buffer* cb, const uint16_t* buff, uint buffer_len)
+void circularBufferCreate(circular_buffer* cb, const uint16_t* buff, uint buffer_len, uint shift)
 {
     cb->buffer = buff;
     cb->buffer_len = buffer_len;
+    cb->shift = shift;
     cb->pos = 0;
 }
 
@@ -18,7 +19,7 @@ void circularBufferRead(circular_buffer* cb, uint16_t* dest, uint len)
 {
     for (int i=0; i<len ; ++i)
     {
-        dest[i] = cb->buffer[cb->pos++];
+        dest[i] = (cb->buffer[cb->pos++] << cb->shift);
         if (cb->pos == cb->buffer_len)
         {
             cb->pos = 0;

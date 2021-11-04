@@ -2,7 +2,7 @@
 #include "pico/stdlib.h"
 
 // Function to populate buffer
-typedef void (*populateBuffer)(uint16_t* pBuffer, uint buffer_len, int id);
+typedef void (*populateBuffer)(uint16_t* pBuffer, uint buffer_len);
 
 // Data for buffers
 typedef struct double_buffer
@@ -16,7 +16,10 @@ typedef struct double_buffer
 } double_buffer;
 
 // Create the buffers
-extern const uint16_t* doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len, populateBuffer fn, int id);
+extern const uint16_t* doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len, populateBuffer fn);
+
+// Restart the buffers
+extern const uint16_t* doubleBufferRestart(double_buffer* db, populateBuffer fn);
 
 // Populate the next buffer
 extern void doubleBufferPopulateNext(double_buffer* db);

@@ -14,6 +14,17 @@ void pwmChannelInit(pwm_data* data, uint gpio_num, float clk_div, uint16_t wrap)
     pwm_init(data->pin_slice, &config, false);
 }
 
+void pwmChannelReconfigure(pwm_data* data, float clk_div, uint16_t wrap)
+{
+    pwm_config config = pwm_get_default_config();
+
+    pwm_config_set_clkdiv(&config, clk_div); 
+    pwm_config_set_wrap(&config, wrap); 
+
+    pwm_init(data->pin_slice, &config, false);
+
+}
+
 // Set the first value inthe pwm
 void pwmChannelSetFirstValue(pwm_data* data, uint16_t value)
 {

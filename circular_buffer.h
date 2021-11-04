@@ -6,11 +6,12 @@ typedef struct circular_buffer
 {
     const uint16_t* buffer;          // Address of buffer
     uint      buffer_len;            // Length of buffer
+    uint      shift;                 // Shift to adjust range of data
     uint      pos;                   // Current read position in buffer
 } circular_buffer;
 
 // Create the buffers
-extern void circularBufferCreate(circular_buffer* cb, const uint16_t* buff, uint buffer_len);
+extern void circularBufferCreate(circular_buffer* cb, const uint16_t* buff, uint buffer_len, uint shift);
 
 // Populate destination from the circular buffer
 extern void circularBufferRead(circular_buffer* cb, uint16_t* dest, uint len);
