@@ -40,11 +40,8 @@ bool stereo = false;
 #endif
 
 colour_noise cn[2];
-void createNoise(uint16_t* buffer, uint len);   // Call back to generate next buffer of noise
-
 static circular_buffer sb;
-void getSound(uint16_t* buffer, uint len);      // Call back to populate buffer from cicrular buffer
-void getFileSound(uint16_t* buffer, uint len);  // Call back to populate buffer from file
+
 
 #ifndef SAMPLE_RATE
 #define SAMPLE_RATE 11000
@@ -82,20 +79,17 @@ static uint16_t ram_buffer[2][RAM_BUFFER_LENGTH];
 
 // Control data blocks for the RAM double buffers
 static double_buffer double_buffers;
-
-static wave_file wf;
-static sd_card_t* pSD;
-static FIL fil;
+void populateCallback(uint16_t* buffer, uint len);   // Call back to generate next buffer of sound
 
 // Pointer to the currenly in use RAM buffer
-static const uint16_t* current_RAM_Buffer;
+static const uint16_t* current_RAM_Buffer = 0;
 
 static float volume = 0.8;                  // Initial volume adjust, controlled by button
 
 // Event queue, used to leave ISR context
 static queue_t eventQueue;
 
-// Collection of events we support
+// Supported events
 enum Event 
 {
     empty = 0,
@@ -107,19 +101,26 @@ enum Event
     quit = change + 1, 
 }; 
 
-// Range of sound colours and files we can play
-enum sound_colour
+// Range of sound colours and files that can be played
+enum sound_state
 {
-    white = 0,
+    off = 0,
+    start = off + 1,
+    white = start,
     pink = white + 1,
     brown = pink + 1,
     file_1 = brown + 1,
     file_2 = file_1 + 1,
-    max = file_2
+    noise_1 = file_2 + 1,
+    end = noise_1 + 1
 };
 
-// Start with brownian (red) noise
-enum sound_colour colour = brown;
+// Helper to determine if state is a colour state
+static inline bool isColour(enum sound_state state) {return (state == white || state == pink || state == brown);}
+static inline bool isFile(enum sound_state state) {return (state == file_1 || state == file_2);}
+
+static void changeState(enum sound_state new_state);
+enum sound_state current_state = off; 
 
 // Four buttons
 static debounce_button_data button[4];
@@ -131,16 +132,23 @@ static void populateDmaBuffer(void);
 static void claimDmaChannels(int num_channels);
 static void initDma(int buffer_index, int slice, int chain_index);
 static void dmaInterruptHandler();
-static bool getRepeatShift(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction);
 
+static bool getSampleValues(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction);
+
+void startMusic(uint32_t sample_rate);
 void stopMusic();
-void pauseMusic();
+void exitMusic();
+
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
-static bool playFile(const char* filename);
 static bool mount(void);
 static void unmount(void);
+static bool loadFile(const char* filename);
 static bool mounted = false;
+static wave_file wf;
+static sd_card_t* pSD;
+static FIL fil;
+
 
 /* 
  * Function definitions
@@ -173,8 +181,13 @@ static void populateDmaBuffer(void)
     {
         // Write to buffer, adjusting for volume
         // build the 32 bit word from the two channels
+#ifdef VOLUME        
         uint32_t left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
         uint32_t right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
+#else
+        uint32_t left = current_RAM_Buffer[(wav_position>>repeat_shift)<<1];
+        uint32_t right = current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1];
+#endif        
         wav_position++;
 
         if (!stereo)
@@ -231,12 +244,11 @@ static void initDma(int buffer_index, int slice, int chain_index)
                           false);
 }
 
-// Determine how often a value needs to be repeated, based on the sampling rate
-// If repeat is 2^m return m
-static bool getRepeatShift(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction)
+// Determin configuration data, based on sample rate
+static bool getSampleValues(uint sample_rate, uint* shift, uint* wrap, uint* mid_point, float* fraction)
 {
     bool ret = true;
-    // Determine the repeat rate
+
     switch (sample_rate)
     {
         case 11000:
@@ -287,45 +299,55 @@ static bool getRepeatShift(uint sample_rate, uint* shift, uint* wrap, uint* mid_
             *fraction = 1.375f;
         break;
 
+        case 12000:
+            *shift = 2;
+            *wrap = 3750;
+            *fraction = 1.0f;
+        break;
+
+        case 24000:
+            *shift = 1;
+            *wrap = 3750;
+            *fraction = 1.0f;
+        break;
+
+        case 48000:
+            *shift = 0;
+            *wrap = 3750;
+            *fraction = 1.0f;
+        break;
+
         default:
             // Not a supported rate
             *wrap = 0;
-            *mid_point = *wrap >> 1;
             ret = false;
         break;
     }
+
+    // mid point is half of wrap value
+    *mid_point = *wrap >> 1;
+
     return ret;
 }
 
 int main(void) 
 {
-    // Overclock to 176MHz so that system clock is a multiple of typical
-    // audio sampling rates - assert if cannot be set
-    set_sys_clock_khz(180000, true);   
+    // Overclock to 180MHz so that system clock is a multiple of typical
+    // audio sampling rates
+    if (!set_sys_clock_khz(180000, true))
+    {
+        panic("Cannot set clock rate\n");
+    }   
     
     // Adjust clock before initialiing, so serial port will work
     stdio_init_all();
     time_init();
 
-    // Initialise the repeat shift, based on sampling rate
-    getRepeatShift(SAMPLE_RATE, &repeat_shift, &wrap, &mid_point, &fraction);
+    // Set up the PWMs with arbiraty values, will be updates when play starts
+    pwmChannelInit(&pwm_channel[0], AUDIO_PIN);
+    pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1);
 
-    // Attempt to mount the file system
-    mount();
-
-    // Set up the PWMs
-    pwmChannelInit(&pwm_channel[0], AUDIO_PIN, fraction, wrap);
-
-    // Set the initial value of the pwm before start
-    pwmChannelSetFirstValue(&pwm_channel[0], mid_point);
-
-    // Set up the right channel
-    pwmChannelInit(&pwm_channel[1], AUDIO_PIN+1, fraction, wrap);
-
-    // Set the initial value of the pwm before start
-    pwmChannelSetFirstValue(&pwm_channel[1], mid_point);
-
-    // Initialise the DMA(s)
+    // Get the DMA channels for the chain
     claimDmaChannels(2);
 
     // Initialise and Chain the two DMAs together
@@ -346,15 +368,6 @@ int main(void)
     dma_set_irq1_channel_mask_enabled(mask, true);
     irq_set_enabled(DMA_IRQ_1, true);
 
-    // Build the pwm start mask
-    uint32_t pwm_mask = 0;
-    
-    pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
-    pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
-    
-    // Build the DMA start mask
-    uint32_t chan_mask = 0x01 << dma_channel[0];
-
     // Initialise the buttons
     debounceButtonCreate(&button[0], 20, 40, buttonCallback, true, false);
     debounceButtonCreate(&button[1], 21, 40, buttonCallback, true, false);
@@ -365,32 +378,27 @@ int main(void)
     enum Event event = empty;
     queue_init(&eventQueue, sizeof(event), 4);
 
-    // Set up and create the sound double buffers in RAM
+    // Set up noise and flash buffer
     colourNoiseCreate(&cn[0], 0.5);
     colourNoiseSeed(&cn[0], 0);
     colourNoiseCreate(&cn[1], 0.5);
     colourNoiseSeed(&cn[1], 2^15-1);
-    populateBuffer fn = &createNoise;
-    //circularBufferCreate(&sb, WAV_DATA, WAV_DATA_LENGTH, shift);
-    //populateBuffer fn = &getSound;
+    circularBufferCreate(&sb, WAV_DATA, WAV_DATA_LENGTH, shift);
 
-    // Start with coloured noise
-    current_RAM_Buffer = doubleBufferCreate(&double_buffers, ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH, fn);
+    // Create the double buffers
+    doubleBufferCreate(&double_buffers, ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH);
 
-    // Populate the DMA buffers
-    populateDmaBuffer();
-    populateDmaBuffer();
+    // Attempt to mount the file system
+    mount();
 
-    // Start the first DMA channel in the chain and both PWMs
-    dma_start_channel_mask(chan_mask);
-    pwmChannelStartList(pwm_mask);
+    // Start by playing brown noise
+    changeState(brown);
 
     /*
      * Main loop Generate noise, handle buttons for volume, parse wav blocks etc
      */
     // Process events
-    bool cont = true;
-    while (cont)
+    while (true)
     {
         queue_remove_blocking(&eventQueue, &event);
         
@@ -413,23 +421,11 @@ int main(void)
             break;
 
             case change:
-                colour += 1;
-                if (colour == max)
-                {
-                    colour = white;
-                }
-                else if (colour == file_1)
-                {
-                    // Need to swap to file_1, but only if mounted
-                    if (!playFile("PinkPanther60.wav"));
-                    {
-                        colour = white;
-                    }
-                }
+                changeState(current_state + 1);
             break;
 
             case quit:
-                cont = false;
+                exitMusic();
             break;
 
             default:
@@ -437,40 +433,110 @@ int main(void)
             break;
         }
     }
-    stopMusic();
-
     return 0;
 }
 
-// Called when a button is pressed
-void buttonCallback(uint gpio_number, enum debounce_event event)
+static void changeState(enum sound_state new_state)
 {
-    enum Event e = empty;
-
-    switch (gpio_number)
+    // Handle wrap
+    if (new_state == end)
     {
-        case 14:
-            e = change;
-        break;
-
-        case 20:
-            e = increase;
-        break;
-
-        case 21:
-            e = decrease;
-        break;
-
-        case 22:
-            e = quit;
-        break;
+        new_state = start;
     }
-    queue_try_add(&eventQueue, &e);
+
+    // Stop playing if we are, and close the file if it is open
+    if (current_state != off)
+    {
+        stopMusic();
+
+        // Close the file, if it was open
+        if (isFile(current_state))
+        {
+            waveFileClose(&wf);
+        }
+    }
+
+    // If moving to file state try to open the file
+    if (new_state == file_1)
+    {
+        if (!loadFile("PinkPanther60.wav"))
+        {
+            new_state += 1;
+        }
+    }
+
+    if (new_state == file_2)
+    {
+        if (!loadFile("M1F1-uint8-AFsp.wav"))
+        {
+            new_state += 1;
+        }
+    }
+
+    // Handle the case where noise is not supported
+    if (new_state == end)
+    {
+        new_state = start;
+    }
+
+    // State needs to be changed before buffers populated
+    current_state = new_state;
+
+    // Now in a position to start playing the sound
+    uint32_t sample_rate;
+
+    if (isColour(current_state))
+    {
+        sample_rate = SAMPLE_RATE;
+    }
+    else if (isFile(current_state))
+    {
+        sample_rate = wf.sample_rate;
+    }
+    else // Loaded from flash
+    {
+        sample_rate = SAMPLE_RATE;
+    }
+    startMusic(sample_rate);
 }
 
-// Disable DMAs and PWMs
-void pauseMusic()
+void startMusic(uint32_t sample_rate)
 {
+    // Empty the message queue, to avoid processing populate messages
+    enum Event skip = empty;
+    while(queue_try_remove(&eventQueue, &skip));
+
+    // Reconfigure the PWM for the new wrap and clock
+    getSampleValues(sample_rate, &repeat_shift, &wrap, &mid_point, &fraction);
+    pwmChannelReconfigure(&pwm_channel[0], fraction, wrap);
+    pwmChannelReconfigure(&pwm_channel[1], fraction, wrap);
+
+    // Reininitialise the double buffers
+    current_RAM_Buffer = doubleBufferInitialise(&double_buffers, &populateCallback);
+
+    // reset read position of RAM buffer to start
+    wav_position = 0;
+
+    // Populate the DMA buffers
+    populateDmaBuffer();
+    populateDmaBuffer();
+
+    // Start the first DMA channel in the chain and both PWMs
+    uint32_t pwm_mask = 0;
+
+    pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
+    pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
+
+    // Build the DMA start mask
+    uint32_t chan_mask = 0x01 << dma_channel[0];
+
+    dma_start_channel_mask(chan_mask);
+    pwmChannelStartList(pwm_mask);
+}
+
+void stopMusic(void)
+{
+    // Disable DMAs and PWMs
     pwmChannelStop(&pwm_channel[0]);
     pwmChannelStop(&pwm_channel[1]);
 
@@ -478,62 +544,12 @@ void pauseMusic()
     dma_channel_abort(dma_channel[1]);
 }
 
-void stopMusic()
+void exitMusic(void)
 {
-    pauseMusic();
+    // Stop music and unmount the file system
+    stopMusic();
     unmount();
-}
-
-// Write coloured noise to supplied buffer
-// callback function called from circular buffer class
-// len is number of 16 bit samples to copy
-void createNoise(uint16_t* buffer, uint len)
-{
-    switch (colour)
-    {
-        case white:
-        {
-            for (int i=0;i<len;i+=2)
-            {
-                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[0]) + 0.5) * wrap);
-                buffer[i+1] = (uint16_t)((colourNoiseWhite(&cn[1]) + 0.5) * wrap);
-            }
-        }
-        break;
-
-        case pink:
-        {
-            for (int i=0;i<len;i+=2)
-            {
-                buffer[i] = (uint16_t)((colourNoisePink(&cn[0]) + 0.5) * wrap);
-                buffer[i+1] = (uint16_t)((colourNoisePink(&cn[1]) + 0.5) * wrap);
-            }
-        }
-        break;
-
-        case brown:
-        {
-            for (int i=0;i<len;i+=2)
-            {
-                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[0]) + 0.5) * wrap);
-                buffer[i+1] = (uint16_t)((colourNoiseBrown(&cn[1]) + 0.5) * wrap);
-            }
-        }
-        break;
-    }
-}
-
-// Populate next sound buffer from circular buffer held in Flash
-// Callback function called from circular buffer class
-// len is number of 16 bit samples to copy
-void getSound(uint16_t* buffer, uint len)
-{
-    circularBufferRead(&sb, buffer, len);
-}
-
-void getFileSound(uint16_t* buffer, uint len)
-{
-    waveFileRead(&wf, buffer, len);
+    current_state = off;
 }
 
 static bool mount(void)
@@ -560,52 +576,96 @@ static void unmount(void)
     f_unmount(pSD->pcName);
 }
 
-static bool playFile(const char* filename)
+static bool loadFile(const char* filename)
 {
-    bool ret = false;
+    bool success = false;
 
     if (mounted)
     {
         if (!waveFileCreate(&wf, &fil, filename))
         {
             printf("Cannot open file: %s\n", filename);
-        }
+        }   
         else
         {
-            // Stop the PWM and DMA
-            pauseMusic();
-
-            // Empty the message queue, to avoid processing populate messages
-            enum Event skip = empty;
-            while(queue_try_remove(&eventQueue, &skip));
-
-            // Reconfigure the PWM for the new wrap and clock
-            getRepeatShift(wf.sample_rate, &repeat_shift, &wrap, &mid_point, &fraction);
-            pwmChannelReconfigure(&pwm_channel[0], fraction, wrap);
-            pwmChannelReconfigure(&pwm_channel[1], fraction, wrap);
-
-            // Reininitialise the double buffers
-            current_RAM_Buffer = doubleBufferRestart(&double_buffers, &getFileSound);
-
-            // reset read position of RAM buffer to start
-            wav_position = 0;
-
-            // Populate the DMA buffers
-            populateDmaBuffer();
-            populateDmaBuffer();
-
-            // Start the first DMA channel in the chain and both PWMs
-            uint32_t pwm_mask = 0;
-    
-            pwmChannelAddStartList(&pwm_channel[0], &pwm_mask);
-            pwmChannelAddStartList(&pwm_channel[1], &pwm_mask);
-    
-            // Build the DMA start mask
-            uint32_t chan_mask = 0x01 << dma_channel[0];
-
-            dma_start_channel_mask(chan_mask);
-            pwmChannelStartList(pwm_mask);
+            success = true;
         }
     }
-    return ret;
+    return success;
 }
+
+// Write 16 bit stereo sound data to to the supplied buffer
+// callback function called from circular buffer class
+// len is number of 16 bit samples to copy
+void populateCallback(uint16_t* buffer, uint len)
+{
+    switch (current_state)
+    {
+        case white:
+        {
+            for (int i=0;i<len;i+=2)
+            {
+                // Divide the output by 2, to make similar volume to other colours
+                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[0]) + 0.5) * (wrap >> 1));
+                buffer[i+1] = (uint16_t)((colourNoiseWhite(&cn[1]) + 0.5) * (wrap >> 1));
+            }
+        }
+        break;
+
+        case pink:
+        {
+            for (int i=0;i<len;i+=2)
+            {
+                buffer[i] = (uint16_t)((colourNoisePink(&cn[0]) + 0.5) * wrap);
+                buffer[i+1] = (uint16_t)((colourNoisePink(&cn[1]) + 0.5) * wrap);
+            }
+        }
+        break;
+
+        case brown:
+        {
+            for (int i=0;i<len;i+=2)
+            {
+                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[0]) + 0.5) * wrap);
+                buffer[i+1] = (uint16_t)((colourNoiseBrown(&cn[1]) + 0.5) * wrap);
+            }
+        }
+        break;
+
+        case file_1:
+        case file_2:
+            waveFileRead(&wf, buffer, len);
+        break;
+
+        case noise_1:
+            circularBufferRead(&sb, buffer, len);
+        break;
+    }
+}
+
+// Called when a button is pressed
+void buttonCallback(uint gpio_number, enum debounce_event event)
+{
+    enum Event e = empty;
+
+    switch (gpio_number)
+    {
+        case 20:
+            e = change;
+        break;
+
+        case 14:
+            e = increase;
+        break;
+
+        case 21:
+            e = decrease;
+        break;
+
+        case 22:
+            e = quit;
+        break;
+    }
+    queue_try_add(&eventQueue, &e);
+}
+

@@ -14,10 +14,10 @@ typedef struct double_buffer
 } double_buffer;
 
 // Create the buffers
-extern const uint16_t* doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len, populateBuffer fn);
+extern void doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len);
 
 // Restart the buffers
-extern const uint16_t* doubleBufferRestart(double_buffer* db, populateBuffer fn);
+extern const uint16_t* doubleBufferInitialise(double_buffer* db, populateBuffer fn);
 
 // Populate the next buffer
 extern void doubleBufferPopulateNext(double_buffer* db);

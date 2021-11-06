@@ -4,29 +4,20 @@
    These are filled by calling a populate function
  */
 
-//local functions
-static const uint16_t* initialiseBuffers(double_buffer* db);
-
 // Create the buffers and populate using supplied function
-const uint16_t* doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len, populateBuffer fn)
+void doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint buffer_len)
 {
      // The buffers are passed this way to allow for case where they are not contiguous
     db->buffers[0] = buff0;
     db->buffers[1] = buff1;
 
     db->buffer_len = buffer_len;
-    db->fn = fn;
-    return initialiseBuffers(db);
+    db->fn = NULL;
 }
 
-const uint16_t* doubleBufferRestart(double_buffer* db, populateBuffer fn)
+const uint16_t* doubleBufferInitialise(double_buffer* db, populateBuffer fn)
 {
     db->fn = fn;
-    return initialiseBuffers(db);
-}
-
-static const uint16_t* initialiseBuffers(double_buffer* db)
-{
     db->buffer_number = 1;  // Starts as 1, as swapped before first populate
 
     // Fill both of the buffers

@@ -1,15 +1,13 @@
 #include "pwm_channel.h"
 
 // Initialise the pwm
-void pwmChannelInit(pwm_data* data, uint gpio_num, float clk_div, uint16_t wrap)
+void pwmChannelInit(pwm_data* data, uint gpio_num)
 {
     pwm_config config = pwm_get_default_config();
 
     gpio_set_function(gpio_num, GPIO_FUNC_PWM);
     data->pin_slice = pwm_gpio_to_slice_num(gpio_num);
     data->gpio_number = gpio_num;
-    pwm_config_set_clkdiv(&config, clk_div); 
-    pwm_config_set_wrap(&config, wrap); 
 
     pwm_init(data->pin_slice, &config, false);
 }

@@ -7,7 +7,7 @@ typedef struct pwm_data {
     uint gpio_number;
 } pwm_data;
 
-extern void pwmChannelInit(pwm_data* data, uint gpio_num, float clk_div, uint16_t wrap);
+extern void pwmChannelInit(pwm_data* data, uint gpio_num);
 extern void pwmChannelReconfigure(pwm_data* data, float clk_div, uint16_t wrap);
 extern void pwmChannelSetFirstValue(pwm_data* data, uint16_t value);
 
