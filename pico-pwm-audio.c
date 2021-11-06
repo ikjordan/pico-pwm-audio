@@ -390,7 +390,7 @@ int main(void)
     // Create the double buffers
     doubleBufferCreate(&double_buffers, ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH);
 
-    // Attempt to mount the file system
+    // Initialise the file system
     fsInitialise(&mount);
     fsMount(&mount);
 
@@ -615,7 +615,7 @@ static bool loadFile(const char* filename)
 {
     bool success = false;
 
-    if (fsMounted(&mount))
+    if (fsMount(&mount))
     {
         if (!waveFileCreate(&wf, filename))
         {

@@ -5,7 +5,8 @@
 // Mount the FatFS
 bool fsMount(fs_mount* fs)
 {
-    if (fs->pSD == NULL)
+    // Only allow mount to fail once, then ignore future requests
+    if ((fs->pSD == NULL) && (!fs->failed))
     {
         fs->pSD = sd_get_by_num(0);
         FRESULT fr = f_mount(&fs->pSD->fatfs, fs->pSD->pcName, 1);
@@ -13,6 +14,7 @@ bool fsMount(fs_mount* fs)
         {
             printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
             fs->pSD = NULL;
+            fs->failed = true;
         }
     }
     return (fs->pSD != NULL);
@@ -22,5 +24,6 @@ bool fsMount(fs_mount* fs)
 void fsUnmount(fs_mount* fs)
 {
     f_unmount(fs->pSD->pcName);
+    fs->pSD = NULL;
 }
 
