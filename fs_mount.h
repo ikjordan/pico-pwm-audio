@@ -7,7 +7,7 @@
 typedef struct fs_mount
 {
     sd_card_t* pSD;
-    bool        failed;     // true if mount failed              
+    bool       failed;     // true if mount failed              
 } fs_mount;
 
 extern bool fsMount(fs_mount* fs);
