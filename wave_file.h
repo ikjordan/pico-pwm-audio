@@ -3,7 +3,8 @@
 // WAVE file header format
 typedef struct wave_file 
 {
-	FIL*     fil;							// FatFS file block
+	FIL      fil;							// FatFS file block
+	bool     init;							// True if initialised
 	uint32_t sample_rate;					// sampling rate (blocks per second)
 	uint32_t data_size;						// NumSamples * NumChannels * BitsPerSample/8 - number of bytes of data
 	uint32_t sample_size;                   // wf->channels * wf->bits_per_sample / 8
@@ -15,7 +16,7 @@ typedef struct wave_file
 } wave_file;
 
 // Function decalarations
-extern bool waveFileCreate(wave_file* wf, FIL* fil, const char* filename);
+extern bool waveFileCreate(wave_file* wf, const char* filename);
 extern void waveFileClose(wave_file* wf);
 
 // Populate destination from the circular buffer

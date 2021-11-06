@@ -5,11 +5,8 @@
 #include "hardware/dma.h"  // dma 
 #include "hardware/sync.h" // wait for interrupt 
 #include "pico/util/queue.h" 
-#include "rtc.h"
-#include "f_util.h"
-#include "ff.h"
-#include "hw_config.h"
 
+#include "fs_mount.h"
 #include "pwm_channel.h"
 #include "debounce_button.h"
 #include "double_buffer.h"
@@ -20,18 +17,16 @@
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
 #define STEREO        // When stereo enabled, currently DMA same data to both channels
-//#define NOISE
+//#define FLASH
 
+#ifdef FLASH
 /* 
  * This include brings in static arrays which contain audio samples. 
  * if you want to know how to make these please see the python code
  * for converting audio samples into static arrays. 
  */
-//#include "preamble.h"
-//#include "panther.h"
 #include "ring.h"
-//#include "sample.h"
-//#include "thats_cool.h"
+#endif
 
 #ifdef STEREO
 bool stereo = true;
@@ -39,7 +34,7 @@ bool stereo = true;
 bool stereo = false;
 #endif
 
-colour_noise cn[2];
+static colour_noise cn[2];
 static circular_buffer sb;
 
 
@@ -49,33 +44,36 @@ static circular_buffer sb;
 #define DMA_BUFFER_LENGTH 2200      // 2200 samples @ 44kHz gives= 0.05 seconds = interrupt rate
 
 #define RAM_BUFFER_LENGTH (4*DMA_BUFFER_LENGTH)
+
 /*
  * Static variable definitions
  */
+#ifdef FLASH
 #ifdef TWELVE_BIT
-static const int shift = 0;
+static const int flash_shift = 0;           // Only used for flash samples
 #else
-static const int shift = 3;
+static const int flash_shift = 3;           // Only used for flash samples
+#endif
 #endif
 
 static uint wrap;                           // Largest value a sample can be + 1
 static int mid_point;                       // wrap divided by 2
 static float fraction = 1;                  // Divider used for PWM
 static int repeat_shift = 1;                // Defined by the sample rate
-static int wav_position = 0;                // Holds current position in ram_buffers for channels
 
 static pwm_data pwm_channel[2];             // Represents the PWM channels
 static int dma_channel[2];                  // The 2 DMA channels used for DMA ping pong
-static int dma_buffer_index = 0;            // Index into active DMA buffer
 
  // Have 2 buffers in RAM that are used to DMA the samples to the PWM engine
 static uint32_t dma_buffer[2][DMA_BUFFER_LENGTH];
+static int dma_buffer_index = 0;            // Index into active DMA buffer
 
 // Have 2 or 4 8k buffers in RAM, copy data from Flash to these buffers - in future
 // will be buffers where noise is created, or music delivered from SD Card
 
 // RAM buffers, controlled through double_buffer class
 static uint16_t ram_buffer[2][RAM_BUFFER_LENGTH];
+static int ram_buffer_index = 0;            // Holds current position in ram_buffers for channels
 
 // Control data blocks for the RAM double buffers
 static double_buffer double_buffers;
@@ -106,18 +104,23 @@ enum sound_state
 {
     off = 0,
     start = off + 1,
-    white = start,
-    pink = white + 1,
-    brown = pink + 1,
+    brown = start,
     file_1 = brown + 1,
     file_2 = file_1 + 1,
-    noise_1 = file_2 + 1,
-    end = noise_1 + 1
+    file_3 = file_2 + 1,
+#ifdef FLASH    
+    flash = file_3 + 1,
+    white = flash + 1,
+#else
+    white = file_3 + 1,
+#endif
+    pink = white + 1,
+    end = pink + 1
 };
 
 // Helper to determine if state is a colour state
 static inline bool isColour(enum sound_state state) {return (state == white || state == pink || state == brown);}
-static inline bool isFile(enum sound_state state) {return (state == file_1 || state == file_2);}
+static inline bool isFile(enum sound_state state) {return (state == file_1 || state == file_2 || state == file_3);}
 
 static void changeState(enum sound_state new_state);
 enum sound_state current_state = off; 
@@ -141,14 +144,13 @@ void exitMusic();
 
 void buttonCallback(uint gpio_number, enum debounce_event event);
 
-static bool mount(void);
-static void unmount(void);
 static bool loadFile(const char* filename);
-static bool mounted = false;
+static fs_mount mount;
 static wave_file wf;
-static sd_card_t* pSD;
-static FIL fil;
 
+#define FILE_NAME_1 "1.wav"
+#define FILE_NAME_2 "2.wav"
+#define FILE_NAME_3 "3.wav"
 
 /* 
  * Function definitions
@@ -185,10 +187,10 @@ static void populateDmaBuffer(void)
         uint32_t left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
         uint32_t right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
 #else
-        uint32_t left = current_RAM_Buffer[(wav_position>>repeat_shift)<<1];
-        uint32_t right = current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1];
+        uint32_t left = current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1];
+        uint32_t right = current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1];
 #endif        
-        wav_position++;
+        ram_buffer_index++;
 
         if (!stereo)
         {
@@ -198,15 +200,15 @@ static void populateDmaBuffer(void)
         }
 
         // Combine the two channels
-        dma_buffer[dma_buffer_index][i] = (left << 16) + right;
+        dma_buffer[dma_buffer_index][i] = (right << 16) + left;
 
-        if ((wav_position<<1) == (RAM_BUFFER_LENGTH<<repeat_shift)) 
+        if ((ram_buffer_index<<1) == (RAM_BUFFER_LENGTH<<repeat_shift)) 
         {
             // Need a new RAM buffer
             current_RAM_Buffer = doubleBufferGetLast(&double_buffers);
 
             // reset read position of RAM buffer to start
-            wav_position = 0;
+            ram_buffer_index = 0;
 
             // Signal to populate a new RAM buffer
             enum Event e = populate_double;
@@ -339,9 +341,8 @@ int main(void)
         panic("Cannot set clock rate\n");
     }   
     
-    // Adjust clock before initialiing, so serial port will work
+    // Adjust frequency before initialiing, so serial port will work
     stdio_init_all();
-    time_init();
 
     // Set up the PWMs with arbiraty values, will be updates when play starts
     pwmChannelInit(&pwm_channel[0], AUDIO_PIN);
@@ -383,13 +384,15 @@ int main(void)
     colourNoiseSeed(&cn[0], 0);
     colourNoiseCreate(&cn[1], 0.5);
     colourNoiseSeed(&cn[1], 2^15-1);
-    circularBufferCreate(&sb, WAV_DATA, WAV_DATA_LENGTH, shift);
-
+#ifdef FLASH    
+    circularBufferCreate(&sb, WAV_DATA, WAV_DATA_LENGTH, flash_shift);
+#endif
     // Create the double buffers
     doubleBufferCreate(&double_buffers, ram_buffer[0], ram_buffer[1], RAM_BUFFER_LENGTH);
 
     // Attempt to mount the file system
-    mount();
+    fsInitialise(&mount);
+    fsMount(&mount);
 
     // Start by playing brown noise
     changeState(brown);
@@ -459,7 +462,7 @@ static void changeState(enum sound_state new_state)
     // If moving to file state try to open the file
     if (new_state == file_1)
     {
-        if (!loadFile("PinkPanther60.wav"))
+        if (!loadFile(FILE_NAME_1))
         {
             new_state += 1;
         }
@@ -467,7 +470,15 @@ static void changeState(enum sound_state new_state)
 
     if (new_state == file_2)
     {
-        if (!loadFile("M1F1-uint8-AFsp.wav"))
+        if (!loadFile(FILE_NAME_2))
+        {
+            new_state += 1;
+        }
+    }
+
+    if (new_state == file_3)
+    {
+        if (!loadFile(FILE_NAME_3))
         {
             new_state += 1;
         }
@@ -491,6 +502,7 @@ static void changeState(enum sound_state new_state)
     }
     else if (isFile(current_state))
     {
+        printf("Sample rate is %u\n", wf.sample_rate);
         sample_rate = wf.sample_rate;
     }
     else // Loaded from flash
@@ -515,7 +527,7 @@ void startMusic(uint32_t sample_rate)
     current_RAM_Buffer = doubleBufferInitialise(&double_buffers, &populateCallback);
 
     // reset read position of RAM buffer to start
-    wav_position = 0;
+    ram_buffer_index = 0;
 
     // Populate the DMA buffers
     populateDmaBuffer();
@@ -548,51 +560,10 @@ void exitMusic(void)
 {
     // Stop music and unmount the file system
     stopMusic();
-    unmount();
+    fsUnmount(&mount);
     current_state = off;
 }
 
-static bool mount(void)
-{
-    if (!mounted)
-    {
-        pSD = sd_get_by_num(0);
-        FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
-        if (FR_OK != fr)
-        {
-            printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-        }
-        else
-        {
-            mounted = true;
-        }
-    }
-    return mounted;
-}
-
-static void unmount(void)
-{
-    mounted = false;   
-    f_unmount(pSD->pcName);
-}
-
-static bool loadFile(const char* filename)
-{
-    bool success = false;
-
-    if (mounted)
-    {
-        if (!waveFileCreate(&wf, &fil, filename))
-        {
-            printf("Cannot open file: %s\n", filename);
-        }   
-        else
-        {
-            success = true;
-        }
-    }
-    return success;
-}
 
 // Write 16 bit stereo sound data to to the supplied buffer
 // callback function called from circular buffer class
@@ -602,45 +573,60 @@ void populateCallback(uint16_t* buffer, uint len)
     switch (current_state)
     {
         case white:
-        {
             for (int i=0;i<len;i+=2)
             {
                 // Divide the output by 2, to make similar volume to other colours
                 buffer[i] = (uint16_t)((colourNoiseWhite(&cn[0]) + 0.5) * (wrap >> 1));
                 buffer[i+1] = (uint16_t)((colourNoiseWhite(&cn[1]) + 0.5) * (wrap >> 1));
             }
-        }
         break;
 
         case pink:
-        {
             for (int i=0;i<len;i+=2)
             {
                 buffer[i] = (uint16_t)((colourNoisePink(&cn[0]) + 0.5) * wrap);
                 buffer[i+1] = (uint16_t)((colourNoisePink(&cn[1]) + 0.5) * wrap);
             }
-        }
         break;
 
         case brown:
-        {
             for (int i=0;i<len;i+=2)
             {
                 buffer[i] = (uint16_t)((colourNoiseBrown(&cn[0]) + 0.5) * wrap);
                 buffer[i+1] = (uint16_t)((colourNoiseBrown(&cn[1]) + 0.5) * wrap);
             }
-        }
         break;
 
-        case file_1:
-        case file_2:
-            waveFileRead(&wf, buffer, len);
-        break;
-
-        case noise_1:
+#ifdef FLASH
+        case flash:
             circularBufferRead(&sb, buffer, len);
         break;
+#endif    
+        default:
+            if (isFile(current_state))
+            {
+                waveFileRead(&wf, buffer, len);
+            }
+        break;
     }
+}
+
+static bool loadFile(const char* filename)
+{
+    bool success = false;
+
+    if (fsMounted(&mount))
+    {
+        if (!waveFileCreate(&wf, filename))
+        {
+            printf("Cannot open file: %s\n", filename);
+        }   
+        else
+        {
+            success = true;
+        }
+    }
+    return success;
 }
 
 // Called when a button is pressed

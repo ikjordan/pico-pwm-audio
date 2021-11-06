@@ -29,24 +29,24 @@ static bool waveFileCheck(wave_file* wf);
   #define STATUS(a) (void)0
 #endif
 
-bool waveFileCreate(wave_file* wf, FIL* fil, const char* filename)
+bool waveFileCreate(wave_file* wf, const char* filename)
 {
-    // Clear the file pointer
-    wf->fil = NULL;
+    wf->init = false;
 
     // open file
     STATUS(("\nOpening  file: %s\n", filename));
-    FRESULT fr = f_open(fil, filename, FA_OPEN_EXISTING | FA_READ);
+    FRESULT fr = f_open(&wf->fil, filename, FA_OPEN_EXISTING | FA_READ);
 
     if (FR_OK != fr)
     {
         printf("Error opening file\n");
         return false;
     }
+    else
+    {
+        wf->init = true;
+    }
  
-    // Store the file handle
-    wf->fil = fil;
-
     // Complete thr rest of the validation
     return waveFileCheck(wf);
 }
@@ -54,16 +54,16 @@ bool waveFileCreate(wave_file* wf, FIL* fil, const char* filename)
 void waveFileClose(wave_file* wf)
 {
     //Close the file, if have a valid handle
-    if (wf->fil != NULL)
+    if (wf->init)
     {
         STATUS(("Closing file..\n"));
-        FRESULT fr = f_close(wf->fil);
+        FRESULT fr = f_close(&wf->fil);
 
         if (FR_OK != fr) 
         {
             printf("f_close error: %s (%d)\n", FRESULT_str(fr), fr);
         }
-        wf->fil = NULL;
+        wf->init = false;
     }
 }
 
@@ -75,14 +75,14 @@ static bool waveFileCheck(wave_file* wf)
     
     // http://soundfile.sapp.org/doc/WaveFormat/
 
-    if (wf->fil == NULL)
+    if (&wf->fil == NULL)
     {
         printf("Invalid file handle\n");
         return false;
     }
 
     // ChunkID
-    if (!file_read(wf->fil, &val32, 4, "ChunkID")) return false;
+    if (!file_read(&wf->fil, &val32, 4, "ChunkID")) return false;
     STATUS(("(0-3)   Chunk ID: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
     
     // Check for "RIFF"
@@ -93,11 +93,11 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // ChunkSize
-    if (!file_read(wf->fil, &val32, sizeof(val32), "ChunkSize")) return false;
+    if (!file_read(&wf->fil, &val32, sizeof(val32), "ChunkSize")) return false;
     STATUS(("(4-7)   ChunkSize: bytes: %u, Kb: %u\n", val32, val32/1024));
 
     // Format
-    if (!file_read(wf->fil, &val32, 4, "Format")) return false;    
+    if (!file_read(&wf->fil, &val32, 4, "Format")) return false;    
     STATUS(("(8-11)  Format: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
     
     // Check for "WAVE"
@@ -108,7 +108,7 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // Subchunk1ID
-    if (!file_read(wf->fil, &val32, 4, "Subchunk1ID")) return false;    
+    if (!file_read(&wf->fil, &val32, 4, "Subchunk1ID")) return false;    
     STATUS(("(12-15) Fmt marker: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
     
     // Check for "fmt "
@@ -119,7 +119,7 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // Subchunk1Size
-    if (!file_read(wf->fil, &val32, sizeof(val32), "Subchunk1Size")) return false;    
+    if (!file_read(&wf->fil, &val32, sizeof(val32), "Subchunk1Size")) return false;    
     STATUS(("(16-19) Subchunk1Size: %u\n", val32));
     
     if (val32 != 16)
@@ -129,7 +129,7 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // AudioFormat
-    if (!file_read(wf->fil, &val16, sizeof(val16),"AudioFormat")) return false;    
+    if (!file_read(&wf->fil, &val16, sizeof(val16),"AudioFormat")) return false;    
 
 #ifdef DEBUG_STATUS   
     char format_name[10] = "";
@@ -150,7 +150,7 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // NumChannels
-    if (!file_read(wf->fil, &wf->channels, sizeof(wf->channels), "NumChannels")) return false;    
+    if (!file_read(&wf->fil, &wf->channels, sizeof(wf->channels), "NumChannels")) return false;    
     STATUS(("(22-23) Channels: %u\n", wf->channels));
     
     if (wf->channels > 2 || wf->channels < 1)
@@ -160,25 +160,25 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // SampleRate
-    if (!file_read(wf->fil, &wf->sample_rate, sizeof(wf->sample_rate), "SampleRate")) return false;    
+    if (!file_read(&wf->fil, &wf->sample_rate, sizeof(wf->sample_rate), "SampleRate")) return false;    
     STATUS(("(24-27) Sample rate: %u\n", wf->sample_rate));
     
-    if (wf->sample_rate < 8000 || wf->sample_rate > 44100)
+    if (wf->sample_rate < 8000 || wf->sample_rate > 48000)
     {
-        printf("Unsupported sample rate: %u\n", wf->channels);
+        printf("Unsupported sample rate: %u\n", wf->sample_rate);
         return false;
     }
 
     // Byte rate
-    if (!file_read(wf->fil, &val32, sizeof(val32), "Byte rate")) return false;    
+    if (!file_read(&wf->fil, &val32, sizeof(val32), "Byte rate")) return false;    
     STATUS(("(28-31) Byte Rate: %u\n", val32));
 
     // Block align
-    if (!file_read(wf->fil, &val16, sizeof(val16), "Block align")) return false;    
+    if (!file_read(&wf->fil, &val16, sizeof(val16), "Block align")) return false;    
     STATUS(("(32-33) Block Alignment: %u\n", val16));
 
     // Bits per sample
-    if (!file_read(wf->fil, &wf->bits_per_sample, sizeof(wf->bits_per_sample), "Bits per sample")) return false;    
+    if (!file_read(&wf->fil, &wf->bits_per_sample, sizeof(wf->bits_per_sample), "Bits per sample")) return false;    
     STATUS(("(34-35) Bits per sample: %u\n", wf->bits_per_sample));
 
     if (wf->bits_per_sample != 8 && wf->bits_per_sample != 16 && wf->bits_per_sample != 32)
@@ -188,21 +188,39 @@ static bool waveFileCheck(wave_file* wf)
     }
 
     // Subchunk2ID
-    file_read(wf->fil, &val32, 4, "Subchunk2ID");    
-    STATUS(("(36-39) Data marker: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
-    
-    // Check for "data"
-    if (val32 != 0x61746164)
+    bool found_data = false;
+    uint32_t data_offset = 36;
+    while (!found_data)
     {
-        printf("Unknown subchunk2 format: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]);
-        return false;
+        file_read(&wf->fil, &val32, 4, "Subchunk2ID");    
+        STATUS(("(%u-%u) Data marker: %c%c%c%c\n", data_offset, data_offset+3, ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
+        data_offset += 4;
+
+        // Check for "data"
+        if (val32 != 0x61746164)
+        {
+            printf("Unknown subchunk2 format: %c%c%c%c\n", ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]);
+
+            // Read the sub chunk size
+            if (!file_read(&wf->fil, &wf->data_size, sizeof(wf->data_size), "Subchunk2Size")) return false;    
+            STATUS(("(%u-%u) Subchunk2Size: %u\n", data_offset, data_offset+3, wf->data_size));
+            data_offset += (4 + wf->data_size);
+            
+            // skip to next chunk
+            f_lseek(&wf->fil, data_offset);
+        }
+        else
+        {
+            found_data = true;
+        }
     }
 
     // Subchunk2Size
-    if (!file_read(wf->fil, &wf->data_size, sizeof(wf->data_size), "Subchunk2Size")) return false;    
-    STATUS(("(40-43) Subchunk2Size: %u\n", wf->data_size));
+    if (!file_read(&wf->fil, &wf->data_size, sizeof(wf->data_size), "Subchunk2Size")) return false;    
+    STATUS(("(%u-%u) Subchunk2Size: %u\n", data_offset, data_offset+3, wf->data_size));
+    data_offset += 4;
     
-    wf->data_offset = 44;
+    wf->data_offset = data_offset;
     wf->current_pos = 0;
     wf->sample_size = wf->channels * wf->bits_per_sample / 8;
 
@@ -251,7 +269,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
         samples_to_read = (samples_left > cache_samples_size) ? cache_samples_size : samples_left;
         samples_to_read = (samples_to_read > samples_to_wrap) ? samples_to_wrap : samples_to_read;
 
-        FRESULT fr = f_read(wf->fil, cache_buffer, samples_to_read * wf->sample_size, &read);
+        FRESULT fr = f_read(&wf->fil, cache_buffer, samples_to_read * wf->sample_size, &read);
         if (FR_OK != fr || read != (wf->sample_size * samples_to_read))
         {
             printf("Read: %i Expected: %i\n", read, wf->sample_size * samples_to_read);
@@ -338,7 +356,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
             STATUS(("file wrap\n"));
 
             // seek back to start of data in file
-            f_lseek(wf->fil, wf->data_offset);
+            f_lseek(&wf->fil, wf->data_offset);
             wf->current_pos = 0;
         }
         samples_left -= samples_to_read;
