@@ -240,7 +240,7 @@ static bool waveFileCheck(wave_file* wf)
 // Fill the destination buffer - with left and right interleaved samples
 // If the wave file is mono, the duplicate left and right channels
 // Len is the number of 16 bit samples to copy to buffer
-bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
+bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
 {
 
     // Read data into holding buffer, then copy to destination buffer
@@ -251,7 +251,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
     // 3) Data in file, before wrap
     // Sample = data for each supported channel (so 4 bytes for 16 bit stereo)
 
-    uint32_t samples_left = len >> 1;         // Number of samples left to write to destination buffer
+    uint32_t samples_left = (wf->channels==2) ? len >> 1 : len;   // Number of samples left to write to destination buffer
                                               // Note always write two samples (for l and r channels)
     uint32_t cache_samples_size = CACHE_BUFFER / wf->sample_size; // Number of samples that fit in read cache
     uint32_t data_index = 0;                           // Index into destination buffer
@@ -290,12 +290,10 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
                 }
                 else
                 {
-                    // Mono, so duplicate sample
+                    // Mono, so write 1 sample
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        dest[data_index] = ((uint16_t)(cache_buffer[i])) << 4;
-                        dest[data_index+1] = dest[data_index];
-                        data_index += 2;
+                        dest[data_index++] = ((uint16_t)(cache_buffer[i])) << 4;
                     }
                 }
             break;
@@ -311,12 +309,10 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
                 }
                 else
                 {
-                    // Mono, so duplicate sample
+                    // Mono, so only write one sample
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        dest[data_index] = (cache_buffer_16[i] + 0x8000) >> 4;
-                        dest[data_index+1] = dest[data_index];
-                        data_index += 2;
+                        dest[data_index++] = (cache_buffer_16[i] + 0x8000) >> 4;
                     }
                 }
             break;
@@ -337,11 +333,10 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint len)
                 }
                 else
                 {
-                    // Mono, so duplicate sample
+                    // Mono, so only write one sample
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        temp_l = (cache_buffer_32[i] + 0x80000000) >> 20;;
-                        dest[data_index++] = (uint16_t)temp_l;
+                        temp_l = (cache_buffer_32[i] + 0x80000000) >> 20;
                         dest[data_index++] = (uint16_t)temp_l;
                     }
                 }

@@ -16,8 +16,8 @@
 
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
-#define STEREO        // When stereo enabled, currently DMA same data to both channels
-//#define FLASH
+#define STEREO        // When stereo not enabled, DMA same l and r data to both channels
+#define FLASH
 
 #ifdef FLASH
 /* 
@@ -29,9 +29,9 @@
 #endif
 
 #ifdef STEREO
-bool stereo = true;
+bool play_stereo = true;
 #else
-bool stereo = false;
+bool play_stereo = false;
 #endif
 
 static colour_noise cn[2];
@@ -73,14 +73,16 @@ static int dma_buffer_index = 0;            // Index into active DMA buffer
 
 // RAM buffers, controlled through double_buffer class
 static uint16_t ram_buffer[2][RAM_BUFFER_LENGTH];
-static int ram_buffer_index = 0;            // Holds current position in ram_buffers for channels
+static bool sampled_stereo = false;         // True if ram_buffer contains stereo, false for mono
 
 // Control data blocks for the RAM double buffers
 static double_buffer double_buffers;
-void populateCallback(uint16_t* buffer, uint len);   // Call back to generate next buffer of sound
+uint32_t populateCallback(uint16_t* buffer, uint32_t len);   // Call back to generate next buffer of sound
 
 // Pointer to the currenly in use RAM buffer
 static const uint16_t* current_RAM_Buffer = 0;
+static int ram_buffer_index = 0;            // Holds current position in ram_buffers for channels
+static uint32_t current_RAM_length = 0;     // number of active samples in current RAM buffer
 
 static float volume = 0.8;                  // Initial volume adjust, controlled by button
 
@@ -178,21 +180,40 @@ static void dmaInterruptHandler()
 // Populate the DMA buffer, referenced by index
 static void populateDmaBuffer(void)
 {
+    uint32_t left;
+    uint32_t right;
+
+    // Calculate the wrap point for the ram_buffer_index
+    uint32_t ram_buffer_wrap = (sampled_stereo) ? (current_RAM_length<<repeat_shift) : (current_RAM_length<<(repeat_shift+1));
+
     // Populate two bytes from each active buffer
     for (int i=0; i<DMA_BUFFER_LENGTH; ++i)
     {
-        // Write to buffer, adjusting for volume
         // build the 32 bit word from the two channels
+        if (sampled_stereo)
+        {
 #ifdef VOLUME        
-        uint32_t left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
-        uint32_t right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
+        // Write to buffer, adjusting for volume
+            left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
+            right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
 #else
-        uint32_t left = current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1];
-        uint32_t right = current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1];
+            left = current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1];
+            right = current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1];
 #endif        
+        }
+        else
+        {
+#ifdef VOLUME        
+        // Write to buffer, adjusting for volume
+            left = ((current_RAM_Buffer[wav_position>>repeat_shift]) - mid_point) * volume + mid_point;
+#else            
+            left = current_RAM_Buffer[ram_buffer_index>>repeat_shift];
+#endif            
+            right = left;
+        }
         ram_buffer_index++;
 
-        if (!stereo)
+        if (!play_stereo)
         {
             // Want mono, so average two channels
             left = (left + right) >> 1;
@@ -202,10 +223,11 @@ static void populateDmaBuffer(void)
         // Combine the two channels
         dma_buffer[dma_buffer_index][i] = (right << 16) + left;
 
-        if ((ram_buffer_index<<1) == (RAM_BUFFER_LENGTH<<repeat_shift)) 
+        if ((ram_buffer_index<<1) == ram_buffer_wrap) 
         {
+            // TO DO - check for buffer used length here
             // Need a new RAM buffer
-            current_RAM_Buffer = doubleBufferGetLast(&double_buffers);
+            doubleBufferGetLast(&double_buffers, &current_RAM_Buffer, &current_RAM_length);
 
             // reset read position of RAM buffer to start
             ram_buffer_index = 0;
@@ -262,6 +284,12 @@ static bool getSampleValues(uint sample_rate, uint* shift, uint* wrap, uint* mid
         case 22000:
             *shift = 1;
             *wrap = 4091;
+            *fraction = 1.0f;
+        break;
+
+        case 11025:
+            *shift = 2;
+            *wrap = 4082;
             *fraction = 1.0f;
         break;
 
@@ -499,15 +527,18 @@ static void changeState(enum sound_state new_state)
     if (isColour(current_state))
     {
         sample_rate = SAMPLE_RATE;
+        sampled_stereo = true;
     }
     else if (isFile(current_state))
     {
         printf("Sample rate is %u\n", wf.sample_rate);
-        sample_rate = wf.sample_rate;
+        sample_rate = getSampleRate(&wf);
+        sampled_stereo = isStereo(&wf);
     }
     else // Loaded from flash
     {
         sample_rate = SAMPLE_RATE;
+        sampled_stereo = false;
     }
     startMusic(sample_rate);
 }
@@ -524,7 +555,7 @@ void startMusic(uint32_t sample_rate)
     pwmChannelReconfigure(&pwm_channel[1], fraction, wrap);
 
     // Reininitialise the double buffers
-    current_RAM_Buffer = doubleBufferInitialise(&double_buffers, &populateCallback);
+    doubleBufferInitialise(&double_buffers, &populateCallback, &current_RAM_Buffer, &current_RAM_length);
 
     // reset read position of RAM buffer to start
     ram_buffer_index = 0;
@@ -567,8 +598,9 @@ void exitMusic(void)
 
 // Write 16 bit stereo sound data to to the supplied buffer
 // callback function called from circular buffer class
-// len is number of 16 bit samples to copy
-void populateCallback(uint16_t* buffer, uint len)
+// len is max number of 16 bit samples to copy
+// Returns the number of 16 bit samples actually copied
+uint32_t populateCallback(uint16_t* buffer, uint32_t len)
 {
     switch (current_state)
     {
@@ -609,6 +641,7 @@ void populateCallback(uint16_t* buffer, uint len)
             }
         break;
     }
+    return len;
 }
 
 static bool loadFile(const char* filename)

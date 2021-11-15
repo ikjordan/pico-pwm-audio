@@ -20,5 +20,9 @@ extern bool waveFileCreate(wave_file* wf, const char* filename);
 extern void waveFileClose(wave_file* wf);
 
 // Populate destination from the circular buffer
-extern bool waveFileRead(wave_file* wf, uint16_t* dest, uint len);
+extern bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len);
+
+// inline functions
+inline uint32_t getSampleRate(wave_file* wf){return wf->sample_rate;}
+inline bool isStereo(wave_file* wf){return (wf->channels == 2);}
 
