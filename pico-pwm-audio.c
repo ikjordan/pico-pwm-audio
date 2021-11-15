@@ -79,6 +79,10 @@ static bool sampled_stereo = false;         // True if ram_buffer contains stere
 static double_buffer double_buffers;
 uint32_t populateCallback(uint16_t* buffer, uint32_t len);   // Call back to generate next buffer of sound
 
+// Working buffer for reading from file
+#define CACHE_BUFFER 4096
+unsigned char cache_buffer[CACHE_BUFFER];
+
 // Pointer to the currenly in use RAM buffer
 static const uint16_t* current_RAM_Buffer = 0;
 static int ram_buffer_index = 0;            // Holds current position in ram_buffers for channels
@@ -650,7 +654,7 @@ static bool loadFile(const char* filename)
 
     if (fsMount(&mount))
     {
-        if (!waveFileCreate(&wf, filename))
+        if (!waveFileCreate(&wf, filename, cache_buffer, CACHE_BUFFER))
         {
             printf("Cannot open file: %s\n", filename);
         }   
