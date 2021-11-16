@@ -24,7 +24,7 @@ static bool waveFileCheck(wave_file* wf);
 #endif
 
 /*
- * wf           structure containing info for thw wave_file instance
+ * wf           structure containing info for the wave_file instance
  * filename     path to the wav file
  * working      An allocated cache buffer, used internally to store data read from file
  * len          Size (in bytes) of the cache buffer
@@ -74,7 +74,7 @@ void waveFileClose(wave_file* wf)
 }
 
 /*
- * wf           structure containing info for thw wave_file instance
+ * wf           structure containing info for the wave_file instance
  * dest         Destination buffer to fill
  * working      An allocated cache buffer, used internally to store data read from file
  * len          number of 16 bit samples to copy to buffer
@@ -87,7 +87,7 @@ void waveFileClose(wave_file* wf)
 bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
 {
 
-    // Read data into holding buffer, then copy to destination buffer
+    // Read data into working buffer, then reformat and copy to destination buffer
     // until destination is full
     // When calculating the size of the read to issue it should be the smallest of:
     // 1) Remaining space in destination buffer
@@ -101,17 +101,14 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
     uint32_t data_index = 0;                           // Index into destination buffer
     uint32_t samples_to_read;                          // Number of samples to read from file next read instance
     uint32_t samples_to_wrap;                          // Samples left to read from file before reaching EOF
-    uint read;
-
-    int16_t* cache_buffer_16 = (int16_t*)wf->working;
-    int32_t* cache_buffer_32 = (int32_t*)wf->working;
+    UINT read;
 
     
     // Take the smaller of the read buffer size and the destination size
     while (samples_left)
     {
         // Calculate the number of samples that can be read before a file wrap
-        samples_to_wrap = (wf->data_size - wf->current_pos) / wf->sample_size;
+        samples_to_wrap = (wf->data_size - wf->file_pos) / wf->sample_size;
 
         // The smaller of the number to fill the destination, or the holding buffer
         samples_to_read = (samples_left > cache_samples_size) ? cache_samples_size : samples_left;
@@ -124,7 +121,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
             printf("Error in f_read of sample %i \n", read);
             return false;
         }
-        // Write the samples - store as 16 bit unsigned values - will also bound here
+        // Write the samples - store as 16 bit signed values
         switch (wf->bits_per_sample)
         {
             case 8:
@@ -132,8 +129,8 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
                 {
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        dest[data_index++] = ((uint16_t)(wf->working[i<<1])) << 4;
-                        dest[data_index++] = ((uint16_t)(wf->working[(i<<1)+1])) << 4;
+                        dest[data_index++] = ((int16_t)(wf->working[i<<1])-0x80) << 8;
+                        dest[data_index++] = ((int16_t)(wf->working[(i<<1)+1]-0x80)) << 8;
                     }
                 }
                 else
@@ -141,7 +138,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
                     // Mono, so write 1 sample
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        dest[data_index++] = ((uint16_t)(wf->working[i])) << 4;
+                        dest[data_index++] = ((uint16_t)(wf->working[i])-0x80) << 4;
                     }
                 }
             break;
@@ -149,32 +146,28 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
             case 16:
                 if (wf->channels == 2)
                 {
-                    for (int i = 0; i < samples_to_read; ++i)
-                    {
-                        dest[data_index++] = (cache_buffer_16[i<<1] + 0x8000) >> 4;
-                        dest[data_index++] =((cache_buffer_16[(i<<1)+1] + 0x8000) >> 4);
-                    }
+                    memcpy(&dest[data_index], wf->working, samples_to_read * sizeof(int16_t) * 2);
+                    data_index += 2 * samples_to_read;
                 }
                 else
                 {
                     // Mono, so only write one sample
-                    for (int i = 0; i < samples_to_read; ++i)
-                    {
-                        dest[data_index++] = (cache_buffer_16[i] + 0x8000) >> 4;
-                    }
+                    memcpy(&dest[data_index], wf->working, samples_to_read * sizeof(int16_t));
+                    data_index += samples_to_read;
                 }
             break;
 
             case 32:
             {
+                int32_t* cache_buffer_32 = (int32_t*)wf->working;
                 uint32_t temp_l;
                 uint32_t temp_r;
                 if (wf->channels == 2)
                 {
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        temp_l = (cache_buffer_32[i<<1] + 0x80000000) >> 20;
-                        temp_r = (cache_buffer_32[(i<<1)+1] + 0x80000000) >> 20;
+                        temp_l = cache_buffer_32[i<<1] >> 16;
+                        temp_r = cache_buffer_32[(i<<1)+1] >> 16;
                         dest[data_index++] = (uint16_t)temp_l;
                         dest[data_index++] = (uint16_t)temp_r;
                     }
@@ -184,7 +177,7 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
                     // Mono, so only write one sample
                     for (int i = 0; i < samples_to_read; ++i)
                     {
-                        temp_l = (cache_buffer_32[i] + 0x80000000) >> 20;
+                        temp_l = cache_buffer_32[i] >> 16;
                         dest[data_index++] = (uint16_t)temp_l;
                     }
                 }
@@ -192,18 +185,20 @@ bool waveFileRead(wave_file* wf, uint16_t* dest, uint32_t len)
             break;
         }
         // Update the current position in the file, and wrap if needed
-        wf->current_pos += read;
+        wf->file_pos += read;
+        samples_left -= samples_to_read;
 
-        if (wf->current_pos == wf->data_size)
+        if (wf->file_pos == wf->data_size)
         {
             STATUS(("file wrap\n"));
 
             // seek back to start of data in file
-            f_lseek(&wf->fil, wf->data_offset);
-            wf->current_pos = 0;
+            f_lseek(&wf->fil, wf->file_offset);
+            wf->file_pos = 0;
         }
-        samples_left -= samples_to_read;
     }
+    // Filled the buffer
+    return true;
 }
 
 /*
@@ -333,12 +328,12 @@ static bool waveFileCheck(wave_file* wf)
 
     // Subchunk2ID
     bool found_data = false;
-    uint32_t data_offset = 36;
+    uint32_t file_offset = 36;
     while (!found_data)
     {
         file_read(&wf->fil, &val32, 4, "Subchunk2ID");    
-        STATUS(("(%u-%u) Data marker: %c%c%c%c\n", data_offset, data_offset+3, ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
-        data_offset += 4;
+        STATUS(("(%u-%u) Data marker: %c%c%c%c\n", file_offset, file_offset+3, ((char *)&val32)[0], ((char *)&val32)[1], ((char *)&val32)[2], ((char *)&val32)[3]));
+        file_offset += 4;
 
         // Check for "data"
         if (val32 != 0x61746164)
@@ -347,11 +342,11 @@ static bool waveFileCheck(wave_file* wf)
 
             // Read the sub chunk size
             if (!file_read(&wf->fil, &wf->data_size, sizeof(wf->data_size), "Subchunk2Size")) return false;    
-            STATUS(("(%u-%u) Subchunk2Size: %u\n", data_offset, data_offset+3, wf->data_size));
-            data_offset += (4 + wf->data_size);
+            STATUS(("(%u-%u) Subchunk2Size: %u\n", file_offset, file_offset+3, wf->data_size));
+            file_offset += (4 + wf->data_size);
             
             // skip to next chunk
-            f_lseek(&wf->fil, data_offset);
+            f_lseek(&wf->fil, file_offset);
         }
         else
         {
@@ -361,11 +356,11 @@ static bool waveFileCheck(wave_file* wf)
 
     // Subchunk2Size
     if (!file_read(&wf->fil, &wf->data_size, sizeof(wf->data_size), "Subchunk2Size")) return false;    
-    STATUS(("(%u-%u) Subchunk2Size: %u\n", data_offset, data_offset+3, wf->data_size));
-    data_offset += 4;
+    STATUS(("(%u-%u) Subchunk2Size: %u\n", file_offset, file_offset+3, wf->data_size));
+    file_offset += 4;
     
-    wf->data_offset = data_offset;
-    wf->current_pos = 0;
+    wf->file_offset = file_offset;
+    wf->file_pos = 0;
     wf->sample_size = wf->channels * wf->bits_per_sample / 8;
 
 #ifdef DEBUG_STATUS    

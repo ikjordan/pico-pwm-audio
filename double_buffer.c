@@ -5,7 +5,7 @@
  */
 
 // Create the buffers and populate using supplied function
-void doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uint32_t buffer_len)
+void doubleBufferCreate(double_buffer* db, int16_t* buff0, int16_t* buff1, uint32_t buffer_len)
 {
      // The buffers are passed this way to allow for case where they are not contiguous
     db->buffers[0] = buff0;
@@ -18,7 +18,7 @@ void doubleBufferCreate(double_buffer* db, uint16_t* buff0, uint16_t* buff1, uin
     db->fn = NULL;
 }
 
-void doubleBufferInitialise(double_buffer* db, populateBuffer fn, const uint16_t** buff, uint32_t* num_samples)
+void doubleBufferInitialise(double_buffer* db, populateBuffer fn, const int16_t** buff, uint32_t* num_samples)
 {
     db->fn = fn;
     db->buffer_number = 1;  // Starts as 1, as swapped before first populate

@@ -50,9 +50,9 @@ static circular_buffer sb;
  */
 #ifdef FLASH
 #ifdef TWELVE_BIT
-static const int flash_shift = 0;           // Only used for flash samples
+static const int flash_shift = 4;           // Only used for flash samples
 #else
-static const int flash_shift = 3;           // Only used for flash samples
+static const int flash_shift = 8;           // Only used for flash samples
 #endif
 #endif
 
@@ -72,19 +72,19 @@ static int dma_buffer_index = 0;            // Index into active DMA buffer
 // will be buffers where noise is created, or music delivered from SD Card
 
 // RAM buffers, controlled through double_buffer class
-static uint16_t ram_buffer[2][RAM_BUFFER_LENGTH];
+static int16_t ram_buffer[2][RAM_BUFFER_LENGTH];
 static bool sampled_stereo = false;         // True if ram_buffer contains stereo, false for mono
 
 // Control data blocks for the RAM double buffers
 static double_buffer double_buffers;
-uint32_t populateCallback(uint16_t* buffer, uint32_t len);   // Call back to generate next buffer of sound
+uint32_t populateCallback(int16_t* buffer, uint32_t len);   // Call back to generate next buffer of sound
 
 // Working buffer for reading from file
 #define CACHE_BUFFER 4096
 unsigned char cache_buffer[CACHE_BUFFER];
 
 // Pointer to the currenly in use RAM buffer
-static const uint16_t* current_RAM_Buffer = 0;
+static const int16_t* current_RAM_Buffer = 0;
 static int ram_buffer_index = 0;            // Holds current position in ram_buffers for channels
 static uint32_t current_RAM_length = 0;     // number of active samples in current RAM buffer
 
@@ -124,9 +124,12 @@ enum sound_state
     end = pink + 1
 };
 
+// To convert from 16 bit signed to unsigned
+#define MID_VALUE 0x8000
+
 // Helper to determine if state is a colour state
 static inline bool isColour(enum sound_state state) {return (state == white || state == pink || state == brown);}
-static inline bool isFile(enum sound_state state) {return (state == file_1 || state == file_2 || state == file_3);}
+static inline bool isWav(enum sound_state state) {return (state == file_1 || state == file_2 || state == file_3);}
 
 static void changeState(enum sound_state new_state);
 enum sound_state current_state = off; 
@@ -198,20 +201,20 @@ static void populateDmaBuffer(void)
         {
 #ifdef VOLUME        
         // Write to buffer, adjusting for volume
-            left = ((current_RAM_Buffer[(wav_position>>repeat_shift)<<1]) - mid_point) * volume + mid_point;
-            right = ((current_RAM_Buffer[((wav_position>>repeat_shift)<<1)+1]) - mid_point) * volume + mid_point;
+            left = ((int32_t)(current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1] * volume) + MID_VALUE) >> 4;
+            right =((int32_t)(current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1] * volume) + MID_VALUE) >> 4;
 #else
-            left = current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1];
-            right = current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1];
+            left = (current_RAM_Buffer[(ram_buffer_index>>repeat_shift)<<1] + MID_VALUE) >> 4;
+            right =(current_RAM_Buffer[((ram_buffer_index>>repeat_shift)<<1)+1] + MID_VALUE) >> 4;
 #endif        
         }
         else
         {
 #ifdef VOLUME        
         // Write to buffer, adjusting for volume
-            left = ((current_RAM_Buffer[wav_position>>repeat_shift]) - mid_point) * volume + mid_point;
+            left = ((int32_t)(current_RAM_Buffer[ram_buffer_index>>repeat_shift] * volume) + MID_VALUE) >> 4;
 #else            
-            left = current_RAM_Buffer[ram_buffer_index>>repeat_shift];
+            left = (current_RAM_Buffer[ram_buffer_index>>repeat_shift] + MID_VALUE) >> 4;
 #endif            
             right = left;
         }
@@ -229,7 +232,6 @@ static void populateDmaBuffer(void)
 
         if ((ram_buffer_index<<1) == ram_buffer_wrap) 
         {
-            // TO DO - check for buffer used length here
             // Need a new RAM buffer
             doubleBufferGetLast(&double_buffers, &current_RAM_Buffer, &current_RAM_length);
 
@@ -485,7 +487,7 @@ static void changeState(enum sound_state new_state)
         stopMusic();
 
         // Close the file, if it was open
-        if (isFile(current_state))
+        if (isWav(current_state))
         {
             waveFileClose(&wf);
         }
@@ -533,11 +535,11 @@ static void changeState(enum sound_state new_state)
         sample_rate = SAMPLE_RATE;
         sampled_stereo = true;
     }
-    else if (isFile(current_state))
+    else if (isWav(current_state))
     {
         printf("Sample rate is %u\n", wf.sample_rate);
-        sample_rate = getSampleRate(&wf);
-        sampled_stereo = isStereo(&wf);
+        sample_rate = waveFileGetSampleRate(&wf);
+        sampled_stereo = waveFileIsStereo(&wf);
     }
     else // Loaded from flash
     {
@@ -604,7 +606,7 @@ void exitMusic(void)
 // callback function called from circular buffer class
 // len is max number of 16 bit samples to copy
 // Returns the number of 16 bit samples actually copied
-uint32_t populateCallback(uint16_t* buffer, uint32_t len)
+uint32_t populateCallback(int16_t* buffer, uint32_t len)
 {
     switch (current_state)
     {
@@ -612,24 +614,24 @@ uint32_t populateCallback(uint16_t* buffer, uint32_t len)
             for (int i=0;i<len;i+=2)
             {
                 // Divide the output by 2, to make similar volume to other colours
-                buffer[i] = (uint16_t)((colourNoiseWhite(&cn[0]) + 0.5) * (wrap >> 1));
-                buffer[i+1] = (uint16_t)((colourNoiseWhite(&cn[1]) + 0.5) * (wrap >> 1));
+                buffer[i] = (int16_t)(colourNoiseWhite(&cn[0]) * (MID_VALUE >> 1));
+                buffer[i+1] = (uint16_t)(colourNoiseWhite(&cn[1]) * (MID_VALUE >> 1));
             }
         break;
 
         case pink:
             for (int i=0;i<len;i+=2)
             {
-                buffer[i] = (uint16_t)((colourNoisePink(&cn[0]) + 0.5) * wrap);
-                buffer[i+1] = (uint16_t)((colourNoisePink(&cn[1]) + 0.5) * wrap);
+                buffer[i] = (int16_t)(colourNoisePink(&cn[0]) * MID_VALUE);
+                buffer[i+1] = (int16_t)(colourNoisePink(&cn[1]) * MID_VALUE);
             }
         break;
 
         case brown:
             for (int i=0;i<len;i+=2)
             {
-                buffer[i] = (uint16_t)((colourNoiseBrown(&cn[0]) + 0.5) * wrap);
-                buffer[i+1] = (uint16_t)((colourNoiseBrown(&cn[1]) + 0.5) * wrap);
+                buffer[i] = (int16_t)(colourNoiseBrown(&cn[0]) * MID_VALUE);
+                buffer[i+1] = (int16_t)(colourNoiseBrown(&cn[1]) * MID_VALUE);
             }
         break;
 
@@ -639,7 +641,7 @@ uint32_t populateCallback(uint16_t* buffer, uint32_t len)
         break;
 #endif    
         default:
-            if (isFile(current_state))
+            if (isWav(current_state))
             {
                 waveFileRead(&wf, buffer, len);
             }
