@@ -12,7 +12,7 @@
 #include "double_buffer.h"
 #include "circular_buffer.h"
 #include "colour_noise.h"
-#include "wave_file.h"
+#include "music_file.h"
 
  
 #define AUDIO_PIN 18  // Configured for the Maker board 18 left, 19 right
@@ -80,7 +80,7 @@ static double_buffer double_buffers;
 uint32_t populateCallback(int16_t* buffer, uint32_t len);   // Call back to generate next buffer of sound
 
 // Working buffer for reading from file
-#define CACHE_BUFFER 4096
+#define CACHE_BUFFER 16000
 unsigned char cache_buffer[CACHE_BUFFER];
 
 // Pointer to the currenly in use RAM buffer
@@ -129,7 +129,7 @@ enum sound_state
 
 // Helper to determine if state is a colour state
 static inline bool isColour(enum sound_state state) {return (state == white || state == pink || state == brown);}
-static inline bool isWav(enum sound_state state) {return (state == file_1 || state == file_2 || state == file_3);}
+static inline bool isFile(enum sound_state state) {return (state == file_1 || state == file_2 || state == file_3);}
 
 static void changeState(enum sound_state new_state);
 enum sound_state current_state = off; 
@@ -155,11 +155,11 @@ void buttonCallback(uint gpio_number, enum debounce_event event);
 
 static bool loadFile(const char* filename);
 static fs_mount mount;
-static wave_file wf;
+static music_file mf;
 
-#define FILE_NAME_1 "1.wav"
-#define FILE_NAME_2 "2.wav"
-#define FILE_NAME_3 "3.wav"
+#define FILE_NAME_1 "1"
+#define FILE_NAME_2 "2"
+#define FILE_NAME_3 "3"
 
 /* 
  * Function definitions
@@ -487,9 +487,9 @@ static void changeState(enum sound_state new_state)
         stopMusic();
 
         // Close the file, if it was open
-        if (isWav(current_state))
+        if (isFile(current_state))
         {
-            waveFileClose(&wf);
+            musicFileClose(&mf);
         }
     }
 
@@ -535,11 +535,11 @@ static void changeState(enum sound_state new_state)
         sample_rate = SAMPLE_RATE;
         sampled_stereo = true;
     }
-    else if (isWav(current_state))
+    else if (isFile(current_state))
     {
-        printf("Sample rate is %u\n", wf.sample_rate);
-        sample_rate = waveFileGetSampleRate(&wf);
-        sampled_stereo = waveFileIsStereo(&wf);
+        printf("Sample rate is %u\n", mf.sample_rate);
+        sample_rate = musicFileGetSampleRate(&mf);
+        sampled_stereo = musicFileIsStereo(&mf);
     }
     else // Loaded from flash
     {
@@ -608,6 +608,8 @@ void exitMusic(void)
 // Returns the number of 16 bit samples actually copied
 uint32_t populateCallback(int16_t* buffer, uint32_t len)
 {
+    uint32_t written = len;
+
     switch (current_state)
     {
         case white:
@@ -641,13 +643,13 @@ uint32_t populateCallback(int16_t* buffer, uint32_t len)
         break;
 #endif    
         default:
-            if (isWav(current_state))
+            if (isFile(current_state))
             {
-                waveFileRead(&wf, buffer, len);
+                musicFileRead(&mf, buffer, len, &written);
             }
         break;
     }
-    return len;
+    return written;
 }
 
 static bool loadFile(const char* filename)
@@ -656,7 +658,7 @@ static bool loadFile(const char* filename)
 
     if (fsMount(&mount))
     {
-        if (!waveFileCreate(&wf, filename, cache_buffer, CACHE_BUFFER))
+        if (!musicFileCreate(&mf, filename, cache_buffer, CACHE_BUFFER))
         {
             printf("Cannot open file: %s\n", filename);
         }   

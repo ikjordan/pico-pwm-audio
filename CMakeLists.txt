@@ -30,8 +30,8 @@ add_executable(pico-pwm-audio pico-pwm-audio.c
                               circular_buffer.c 
                               colour_noise.c
                               hw_config.c
-                              wave_file.c
-                              fs_mount.c)
+                              fs_mount.c
+                              ./picomp3lib/interface/music_file.c)
 
 pico_set_program_name(pico-pwm-audio "pico-pwm-audio")
 pico_set_program_version(pico-pwm-audio "0.2")
@@ -40,9 +40,10 @@ pico_enable_stdio_uart(pico-pwm-audio 1)
 pico_enable_stdio_usb(pico-pwm-audio 0)
 
 add_subdirectory(no-OS-FatFS-SD-SPI-RPi-Pico/FatFs_SPI build)
+add_subdirectory(picomp3lib/src)
 
 # Add the standard library to the build
-target_link_libraries(pico-pwm-audio pico_stdlib FatFs_SPI)
+target_link_libraries(pico-pwm-audio pico_stdlib)
 
 # Add any user requested libraries
 target_link_libraries(pico-pwm-audio
@@ -51,6 +52,8 @@ target_link_libraries(pico-pwm-audio
         hardware_timer
         hardware_clocks
         hardware_pwm
+        FatFs_SPI 
+        picomp3lib
         )
 
 pico_add_extra_outputs(pico-pwm-audio)

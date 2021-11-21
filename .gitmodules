@@ -1,3 +1,6 @@
 [submodule "no-OS-FatFS-SD-SPI-RPi-Pico"]
 	path = no-OS-FatFS-SD-SPI-RPi-Pico
 	url = https://github.com/carlk3/no-OS-FatFS-SD-SPI-RPi-Pico.git
+[submodule "picomp3lib"]
+	path = picomp3lib
+	url = https://github.com/ikjordan/picomp3lib.git

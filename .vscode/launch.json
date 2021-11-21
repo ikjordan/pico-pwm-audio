@@ -11,6 +11,7 @@
             "request": "launch",
             "type": "cortex-debug",
             "servertype": "openocd",
+            "gdbPath": "gdb-multiarch",
             "device": "RP2040",
             "configFiles": [
                 "interface/raspberrypi-swd.cfg",
